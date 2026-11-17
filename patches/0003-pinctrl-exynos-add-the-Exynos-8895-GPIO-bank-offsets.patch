@@ -1,0 +1,296 @@
+From 2cffcc1bb8d2485060b116a069d7db5787bb6453 Mon Sep 17 00:00:00 2001
+From: proshiv85-byte <proshiv85@gmail.com>
+Date: Tue, 17 Nov 2026 20:13:16 +0200
+Subject: [PATCH 3/6] pinctrl: exynos: add the Exynos 8895, GPIO bank offsets
+ from the table
+
+The pin banks of the 8895, from Linux. Its ALIVE controller starts with
+GPA0 at offset 0x20, while the GPIO driver places the banks of the
+device tree one after the other from the controller base. Controllers
+may now ask the GPIO driver to take the bank offsets from their table
+(gpio_bank_offsets), the 8895 does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/gpio/s5p_gpio.c                     |   8 ++
+ drivers/pinctrl/exynos/Kconfig              |   8 ++
+ drivers/pinctrl/exynos/Makefile             |   1 +
+ drivers/pinctrl/exynos/pinctrl-exynos.c     |  41 ++++++
+ drivers/pinctrl/exynos/pinctrl-exynos.h     |   6 +
+ drivers/pinctrl/exynos/pinctrl-exynos8895.c | 130 ++++++++++++++++++++
+ 6 files changed, 194 insertions(+)
+ create mode 100644 drivers/pinctrl/exynos/pinctrl-exynos8895.c
+
+diff --git a/drivers/gpio/s5p_gpio.c b/drivers/gpio/s5p_gpio.c
+index c072f1465..a7f511c23 100644
+--- a/drivers/gpio/s5p_gpio.c
++++ b/drivers/gpio/s5p_gpio.c
+@@ -13,6 +13,7 @@
+ #include <asm/io.h>
+ #include <asm/gpio.h>
+ #include <dm/device-internal.h>
++#include "../pinctrl/exynos/pinctrl-exynos.h"
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+@@ -323,6 +324,7 @@ static int gpio_exynos_bind(struct udevice *parent)
+ 		struct exynos_gpio_plat *plat;
+ 		struct udevice *dev;
+ 		fdt_addr_t reg;
++		u32 __maybe_unused offset;
+ 		int ret;
+ 
+ 		if (!fdtdec_get_bool(blob, node, "gpio-controller"))
+@@ -340,6 +342,12 @@ static int gpio_exynos_bind(struct udevice *parent)
+ 		reg = dev_read_addr(dev);
+ 		if (reg != FDT_ADDR_T_NONE)
+ 			bank = (struct s5p_gpio_bank *)((ulong)base + reg);
++#if CONFIG_IS_ENABLED(PINCTRL_EXYNOS)
++		else if (device_get_uclass_id(parent->parent) == UCLASS_PINCTRL &&
++			 !exynos_pinctrl_gpio_bank_offset(parent->parent,
++							  plat->bank_name, &offset))
++			bank = (struct s5p_gpio_bank *)((ulong)base + offset);
++#endif
+ 
+ 		debug("dev at %p: %s\n", bank, plat->bank_name);
+ 		plat->bank = bank++;
+diff --git a/drivers/pinctrl/exynos/Kconfig b/drivers/pinctrl/exynos/Kconfig
+index 1b7fb62bc..33267e746 100644
+--- a/drivers/pinctrl/exynos/Kconfig
++++ b/drivers/pinctrl/exynos/Kconfig
+@@ -24,3 +24,11 @@ config PINCTRL_EXYNOS850
+ 	help
+ 	  Support pin multiplexing and pin configuration control on
+ 	  Samsung's Exynos850 SoC.
++
++config PINCTRL_EXYNOS8895
++	bool "Samsung Exynos8895 pinctrl driver"
++	depends on ARCH_EXYNOS && PINCTRL_FULL
++	select PINCTRL_EXYNOS
++	help
++	  Support pin multiplexing and pin configuration control on
++	  Samsung's Exynos8895 SoC.
+diff --git a/drivers/pinctrl/exynos/Makefile b/drivers/pinctrl/exynos/Makefile
+index 3abe1226e..4a600c0fa 100644
+--- a/drivers/pinctrl/exynos/Makefile
++++ b/drivers/pinctrl/exynos/Makefile
+@@ -7,3 +7,4 @@ obj-$(CONFIG_PINCTRL_EXYNOS)		+= pinctrl-exynos.o
+ obj-$(CONFIG_PINCTRL_EXYNOS7420)	+= pinctrl-exynos7420.o
+ obj-$(CONFIG_PINCTRL_EXYNOS78x0)	+= pinctrl-exynos78x0.o
+ obj-$(CONFIG_PINCTRL_EXYNOS850)		+= pinctrl-exynos850.o
++obj-$(CONFIG_PINCTRL_EXYNOS8895)	+= pinctrl-exynos8895.o
+diff --git a/drivers/pinctrl/exynos/pinctrl-exynos.c b/drivers/pinctrl/exynos/pinctrl-exynos.c
+index 4c06b41c7..91ff02726 100644
+--- a/drivers/pinctrl/exynos/pinctrl-exynos.c
++++ b/drivers/pinctrl/exynos/pinctrl-exynos.c
+@@ -189,3 +189,44 @@ int exynos_pinctrl_bind(struct udevice *dev)
+ 	return device_bind_driver_to_node(dev, "gpio_exynos", "gpio-banks",
+ 					  dev_ofnode(dev), NULL);
+ }
++
++/**
++ * exynos_pinctrl_gpio_bank_offset() - offset of a GPIO bank in a controller
++ * @dev: the pin controller
++ * @name: name of the bank's device tree node, e.g. "gpa0-gpio-bank"
++ * @offset: returns the offset of the bank's registers
++ *
++ * Return: 0 if the controller knows the bank and wants its GPIO banks
++ * placed from its table, -ENOENT otherwise.
++ */
++int exynos_pinctrl_gpio_bank_offset(struct udevice *dev, const char *name,
++				    u32 *offset)
++{
++	const struct samsung_pin_ctrl *ctrl;
++	int seq = dev_seq(dev);
++	int i;
++
++	ctrl = (const struct samsung_pin_ctrl *)dev_get_driver_data(dev);
++	if (!ctrl || seq < 0)
++		return -ENOENT;
++
++	for (i = 0; i < seq; i++)
++		if (!ctrl[i].pin_banks)
++			return -ENOENT;
++	ctrl += seq;
++	if (!ctrl->pin_banks || !ctrl->gpio_bank_offsets)
++		return -ENOENT;
++
++	for (i = 0; i < ctrl->nr_banks; i++) {
++		const char *bank = ctrl->pin_banks[i].name;
++		size_t len = strlen(bank);
++
++		if (!strncmp(name, bank, len) &&
++		    (name[len] == '\0' || name[len] == '-')) {
++			*offset = ctrl->pin_banks[i].offset;
++			return 0;
++		}
++	}
++
++	return -ENOENT;
++}
+diff --git a/drivers/pinctrl/exynos/pinctrl-exynos.h b/drivers/pinctrl/exynos/pinctrl-exynos.h
+index 73cc2ce41..78027913d 100644
+--- a/drivers/pinctrl/exynos/pinctrl-exynos.h
++++ b/drivers/pinctrl/exynos/pinctrl-exynos.h
+@@ -62,10 +62,14 @@ extern const struct samsung_pin_bank_type bank_type_alive;
+  * struct samsung_pin_ctrl: represent a pin controller.
+  * @pin_banks: list of pin banks included in this controller.
+  * @nr_banks: number of pin banks.
++ * @gpio_bank_offsets: the GPIO driver takes the offsets of the banks from
++ *	@pin_banks, instead of assuming that the banks of the device tree
++ *	follow each other from the start of the controller.
+  */
+ struct samsung_pin_ctrl {
+ 	const struct samsung_pin_bank_data *pin_banks;
+ 	u32 nr_banks;
++	bool gpio_bank_offsets;
+ };
+ 
+ /**
+@@ -98,5 +102,7 @@ int exynos_pinctrl_set_state(struct udevice *dev,
+ 		struct udevice *config);
+ int exynos_pinctrl_probe(struct udevice *dev);
+ int exynos_pinctrl_bind(struct udevice *dev);
++int exynos_pinctrl_gpio_bank_offset(struct udevice *dev, const char *name,
++				    u32 *offset);
+ 
+ #endif /* __PINCTRL_EXYNOS_H_ */
+diff --git a/drivers/pinctrl/exynos/pinctrl-exynos8895.c b/drivers/pinctrl/exynos/pinctrl-exynos8895.c
+new file mode 100644
+index 000000000..0bf12a714
+--- /dev/null
++++ b/drivers/pinctrl/exynos/pinctrl-exynos8895.c
+@@ -0,0 +1,130 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Exynos8895 pinctrl driver
++ *
++ * Pin bank data from the Linux pinctrl-exynos-arm64.c driver.
++ */
++
++#include <dm.h>
++#include <dm/pinctrl.h>
++#include "pinctrl-exynos.h"
++
++/* the bitfields are 4 bits wide, apart from the data */
++static const struct samsung_pin_bank_type exynos8895_bank_type = {
++	.fld_width = { 4, 1, 4, 4, },
++	.reg_offset = { 0x00, 0x04, 0x08, 0x0c, },
++};
++
++#define EXYNOS8895_PIN_BANK(pins, reg, id)		\
++	{						\
++		.type		= &exynos8895_bank_type,	\
++		.offset		= reg,			\
++		.nr_pins	= pins,			\
++		.name		= id			\
++	}
++
++/* pin banks of pin-controller 0 (ALIVE) */
++static const struct samsung_pin_bank_data exynos8895_pin_banks0[] = {
++	EXYNOS8895_PIN_BANK(8, 0x020, "gpa0"),
++	EXYNOS8895_PIN_BANK(8, 0x040, "gpa1"),
++	EXYNOS8895_PIN_BANK(8, 0x060, "gpa2"),
++	EXYNOS8895_PIN_BANK(8, 0x080, "gpa3"),
++	EXYNOS8895_PIN_BANK(7, 0x0a0, "gpa4"),
++};
++
++/* pin banks of pin-controller 1 (ABOX) */
++static const struct samsung_pin_bank_data exynos8895_pin_banks1[] = {
++	EXYNOS8895_PIN_BANK(8, 0x000, "gph0"),
++	EXYNOS8895_PIN_BANK(7, 0x020, "gph1"),
++	EXYNOS8895_PIN_BANK(4, 0x040, "gph3"),
++};
++
++/* pin banks of pin-controller 2 (VTS) */
++static const struct samsung_pin_bank_data exynos8895_pin_banks2[] = {
++	EXYNOS8895_PIN_BANK(3, 0x000, "gph2"),
++};
++
++/* pin banks of pin-controller 3 (FSYS0) */
++static const struct samsung_pin_bank_data exynos8895_pin_banks3[] = {
++	EXYNOS8895_PIN_BANK(3, 0x000, "gpi0"),
++	EXYNOS8895_PIN_BANK(8, 0x020, "gpi1"),
++};
++
++/* pin banks of pin-controller 4 (FSYS1) */
++static const struct samsung_pin_bank_data exynos8895_pin_banks4[] = {
++	EXYNOS8895_PIN_BANK(8, 0x000, "gpj1"),
++	EXYNOS8895_PIN_BANK(7, 0x020, "gpj0"),
++};
++
++/* pin banks of pin-controller 5 (BUSC) */
++static const struct samsung_pin_bank_data exynos8895_pin_banks5[] = {
++	EXYNOS8895_PIN_BANK(2, 0x000, "gpb2"),
++};
++
++/* pin banks of pin-controller 6 (PERIC0) */
++static const struct samsung_pin_bank_data exynos8895_pin_banks6[] = {
++	EXYNOS8895_PIN_BANK(8, 0x000, "gpd0"),
++	EXYNOS8895_PIN_BANK(8, 0x020, "gpd1"),
++	EXYNOS8895_PIN_BANK(4, 0x040, "gpd2"),
++	EXYNOS8895_PIN_BANK(5, 0x060, "gpd3"),
++	EXYNOS8895_PIN_BANK(4, 0x080, "gpb1"),
++	EXYNOS8895_PIN_BANK(8, 0x0a0, "gpe7"),
++	EXYNOS8895_PIN_BANK(8, 0x0c0, "gpf1"),
++};
++
++/* pin banks of pin-controller 7 (PERIC1) */
++static const struct samsung_pin_bank_data exynos8895_pin_banks7[] = {
++	EXYNOS8895_PIN_BANK(3, 0x000, "gpb0"),
++	EXYNOS8895_PIN_BANK(5, 0x020, "gpc0"),
++	EXYNOS8895_PIN_BANK(5, 0x040, "gpc1"),
++	EXYNOS8895_PIN_BANK(8, 0x060, "gpc2"),
++	EXYNOS8895_PIN_BANK(8, 0x080, "gpc3"),
++	EXYNOS8895_PIN_BANK(4, 0x0a0, "gpk0"),
++	EXYNOS8895_PIN_BANK(8, 0x0c0, "gpe5"),
++	EXYNOS8895_PIN_BANK(8, 0x0e0, "gpe6"),
++	EXYNOS8895_PIN_BANK(8, 0x100, "gpe2"),
++	EXYNOS8895_PIN_BANK(8, 0x120, "gpe3"),
++	EXYNOS8895_PIN_BANK(8, 0x140, "gpe4"),
++	EXYNOS8895_PIN_BANK(4, 0x160, "gpf0"),
++	EXYNOS8895_PIN_BANK(8, 0x180, "gpe1"),
++	EXYNOS8895_PIN_BANK(2, 0x1a0, "gpg0"),
++};
++
++#define EXYNOS8895_PIN_CTRL(banks) {			\
++		.pin_banks	= banks,		\
++		.nr_banks	= ARRAY_SIZE(banks),	\
++		.gpio_bank_offsets = true,		\
++	}
++
++/* in the order of the pinctrl aliases of the device tree */
++static const struct samsung_pin_ctrl exynos8895_pin_ctrl[] = {
++	EXYNOS8895_PIN_CTRL(exynos8895_pin_banks0),
++	EXYNOS8895_PIN_CTRL(exynos8895_pin_banks1),
++	EXYNOS8895_PIN_CTRL(exynos8895_pin_banks2),
++	EXYNOS8895_PIN_CTRL(exynos8895_pin_banks3),
++	EXYNOS8895_PIN_CTRL(exynos8895_pin_banks4),
++	EXYNOS8895_PIN_CTRL(exynos8895_pin_banks5),
++	EXYNOS8895_PIN_CTRL(exynos8895_pin_banks6),
++	EXYNOS8895_PIN_CTRL(exynos8895_pin_banks7),
++	{ /* list terminator */ }
++};
++
++static const struct pinctrl_ops exynos8895_pinctrl_ops = {
++	.set_state	= exynos_pinctrl_set_state,
++};
++
++static const struct udevice_id exynos8895_pinctrl_ids[] = {
++	{ .compatible = "samsung,exynos8895-pinctrl",
++	  .data = (ulong)exynos8895_pin_ctrl },
++	{ }
++};
++
++U_BOOT_DRIVER(pinctrl_exynos8895) = {
++	.name		= "pinctrl_exynos8895",
++	.id		= UCLASS_PINCTRL,
++	.of_match	= exynos8895_pinctrl_ids,
++	.priv_auto	= sizeof(struct exynos_pinctrl_priv),
++	.ops		= &exynos8895_pinctrl_ops,
++	.probe		= exynos_pinctrl_probe,
++	.bind		= exynos_pinctrl_bind,
++};
+-- 
+2.56.0
+

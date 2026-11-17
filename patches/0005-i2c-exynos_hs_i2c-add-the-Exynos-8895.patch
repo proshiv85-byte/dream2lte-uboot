@@ -1,0 +1,98 @@
+From 85e98f677edf573d1210806098aa510848c8c520 Mon Sep 17 00:00:00 2001
+From: proshiv85-byte <proshiv85@gmail.com>
+Date: Tue, 17 Nov 2026 20:13:16 +0200
+Subject: [PATCH 5/6] i2c: exynos_hs_i2c: add the Exynos 8895
+
+Like the Exynos 7 variant, with the clock divider formula of the 8895
+(as in Linux) and the controller set to I2C master mode.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/i2c/exynos_hs_i2c.c | 23 +++++++++++++++++++++++
+ drivers/i2c/s3c24x0_i2c.h   |  1 +
+ 2 files changed, 24 insertions(+)
+
+diff --git a/drivers/i2c/exynos_hs_i2c.c b/drivers/i2c/exynos_hs_i2c.c
+index 5c7553068..11ac8f8bd 100644
+--- a/drivers/i2c/exynos_hs_i2c.c
++++ b/drivers/i2c/exynos_hs_i2c.c
+@@ -154,6 +154,7 @@ static int hsi2c_wait_for_trx(struct exynos5_hsi2c *i2c,
+ 			}
+ 			return I2C_OK;
+ 		case VARIANT_HSI2C_EXYNOS7:
++		case VARIANT_HSI2C_EXYNOS8895:
+ 			if (int_status & HSI2C_INT_TRANS_DONE)
+ 				return I2C_OK;
+ 
+@@ -211,6 +212,21 @@ static int hsi2c_get_clk_details(struct udevice *dev)
+ 	 * uTemp2 = TSCLK_L + TSCLK_H
+ 	 */
+ 	t_ftl_cycle = (readl(&hsregs->usi_conf) >> 16) & 0x7;
++
++	if (i2c_bus->variant == VARIANT_HSI2C_EXYNOS8895) {
++		/* FPCLK / FI2C = (CLK_DIV + 1) * (TSCLK_L + TSCLK_H + 2) +
++		 *		  2 * (FLT_CYCLE + 3)
++		 */
++		utemp0 = (clkin / op_clk) - (t_ftl_cycle + 3) * 2;
++		i = utemp0 / 512;
++		utemp1 = (utemp0 + ((t_ftl_cycle + 3) % (i + 1)) * 2) / (i + 1);
++		if (utemp0 < 4 || i >= 256 || utemp1 < 4)
++			return -EINVAL;
++		i2c_bus->clk_cycle = utemp1 - 2;
++		i2c_bus->clk_div = i;
++		return 0;
++	}
++
+ 	utemp0 = (clkin / op_clk) - 8 - 2 * t_ftl_cycle;
+ 
+ 	/* CLK_DIV max is 256 */
+@@ -254,6 +270,10 @@ static void hsi2c_ch_init(struct s3c24x0_i2c_bus *i2c_bus)
+ 	i2c_timing_s3 = n_clkdiv << 16 | t_sr_release << 0;
+ 	i2c_timing_sla = t_data_hd << 0;
+ 
++	/* master mode isn't set up for these by pin configuration */
++	if (i2c_bus->variant == VARIANT_HSI2C_EXYNOS8895)
++		writel(HSI2C_FUNC_MODE_I2C | HSI2C_MASTER, &hsregs->usi_ctl);
++
+ 	writel(HSI2C_TRAILING_COUNT, &hsregs->usi_trailing_ctl);
+ 
+ 	/* Clear to enable Timeout */
+@@ -268,6 +288,7 @@ static void hsi2c_ch_init(struct s3c24x0_i2c_bus *i2c_bus)
+ 		writel(HSI2C_INT_I2C_EN, &hsregs->usi_int_en);
+ 		break;
+ 	case VARIANT_HSI2C_EXYNOS7:
++	case VARIANT_HSI2C_EXYNOS8895:
+ 		writel(HSI2C_INT_I2C_TRANS_EN, &hsregs->usi_int_en);
+ 		break;
+ 	default:
+@@ -407,6 +428,7 @@ static int hsi2c_prepare_transaction(struct exynos5_hsi2c *i2c,
+ 		writel(HSI2C_INT_I2C_EN, &i2c->usi_int_stat);
+ 		break;
+ 	case VARIANT_HSI2C_EXYNOS7:
++	case VARIANT_HSI2C_EXYNOS8895:
+ 		writel(HSI2C_INT_I2C_TRANS_EN, &i2c->usi_int_stat);
+ 		break;
+ 	default:
+@@ -635,6 +657,7 @@ static const struct dm_i2c_ops exynos_hs_i2c_ops = {
+ static const struct udevice_id exynos_hs_i2c_ids[] = {
+ 	{ .compatible = "samsung,exynos5-hsi2c", .data = VARIANT_HSI2C_EXYNOS5 },
+ 	{ .compatible = "samsung,exynos7-hsi2c", .data = VARIANT_HSI2C_EXYNOS7 },
++	{ .compatible = "samsung,exynos8895-hsi2c", .data = VARIANT_HSI2C_EXYNOS8895 },
+ 	{ }
+ };
+ 
+diff --git a/drivers/i2c/s3c24x0_i2c.h b/drivers/i2c/s3c24x0_i2c.h
+index e73a36218..b4cf607f0 100644
+--- a/drivers/i2c/s3c24x0_i2c.h
++++ b/drivers/i2c/s3c24x0_i2c.h
+@@ -50,6 +50,7 @@ enum s3c24x0_i2c_variant {
+ 	VARIANT_NONE,
+ 	VARIANT_HSI2C_EXYNOS5,
+ 	VARIANT_HSI2C_EXYNOS7,
++	VARIANT_HSI2C_EXYNOS8895,
+ };
+ 
+ struct s3c24x0_i2c_bus {
+-- 
+2.56.0
+

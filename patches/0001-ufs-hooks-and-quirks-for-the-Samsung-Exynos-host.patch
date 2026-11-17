@@ -1,0 +1,312 @@
+From c8248d3df003ca7f3d2e1dfa866dd7ec727d6084 Mon Sep 17 00:00:00 2001
+From: proshiv85-byte <proshiv85@gmail.com>
+Date: Tue, 17 Nov 2026 20:13:16 +0200
+Subject: [PATCH 1/6] ufs: hooks and quirks for the Samsung Exynos host
+
+Additions the Exynos UFS host needs, as in Linux:
+
+- pwr_change_notify: called before and after the power mode change
+- setup_xfer_req: called before a request, with whether it is a SCSI
+  command (the Exynos HCI has a per-slot "nexus type")
+- get_upmcrs: hosts that report the power mode change result in their
+  own register; the core then waits for the completion interrupt
+  (UPMS) before it reads the result
+- max_prdt_entry_size and dma_align: the Exynos HCI moves data in PRDT
+  entries of one 4 KiB data unit, with 4 KiB aligned buffers (bounce
+  buffer otherwise); max_bytes_per_req follows the entry size
+- UFSHCD_QUIRK_PRDT_BYTE_GRAN was defined but not implemented: the
+  UTRD offsets and lengths, and the PRDT length, are in bytes then
+- UFSHCD_QUIRK_BROKEN_OCS_FATAL_ERROR: an OCS fatal error with a
+  response UPIU carrying a response or status is a valid response
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/ufs/ufs-uclass.c | 98 +++++++++++++++++++++++++++++++++++-----
+ drivers/ufs/ufs.h        | 32 +++++++++++++
+ 2 files changed, 118 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/ufs/ufs-uclass.c b/drivers/ufs/ufs-uclass.c
+index 2ca4fb2a0..0c20a48de 100644
+--- a/drivers/ufs/ufs-uclass.c
++++ b/drivers/ufs/ufs-uclass.c
+@@ -60,7 +60,6 @@
+ #define MAX_PRDT_ENTRY	262144
+ 
+ /* maximum bytes per request */
+-#define UFS_MAX_BYTES	(128 * 256 * 1024)
+ 
+ static inline bool ufshcd_is_hba_active(struct ufs_hba *hba);
+ static inline void ufshcd_hba_stop(struct ufs_hba *hba);
+@@ -199,6 +198,8 @@ static int ufshcd_send_uic_cmd(struct ufs_hba *hba, struct uic_command *uic_cmd)
+ 		intr_status = ufshcd_readl(hba, REG_INTERRUPT_STATUS);
+ 		enabled_intr_status = intr_status & hba->intr_mask;
+ 		ufshcd_writel(hba, intr_status, REG_INTERRUPT_STATUS);
++		if (intr_status & UIC_POWER_MODE)
++			hba->uic_power_mode_seen = true;
+ 
+ 		if (get_timer(start) > UFS_UIC_CMD_TIMEOUT) {
+ 			dev_err(hba->dev,
+@@ -671,9 +672,16 @@ static void ufshcd_host_memory_configure(struct ufs_hba *hba)
+ 	response_offset = offsetof(struct utp_transfer_cmd_desc, response_upiu);
+ 	prdt_offset = offsetof(struct utp_transfer_cmd_desc, prd_table);
+ 
+-	utrdlp->response_upiu_offset = cpu_to_le16(response_offset >> 2);
+-	utrdlp->prd_table_offset = cpu_to_le16(prdt_offset >> 2);
+-	utrdlp->response_upiu_length = cpu_to_le16(ALIGNED_UPIU_SIZE >> 2);
++	/* in double words, unless the host counts them in bytes */
++	if (hba->quirks & UFSHCD_QUIRK_PRDT_BYTE_GRAN) {
++		utrdlp->response_upiu_offset = cpu_to_le16(response_offset);
++		utrdlp->prd_table_offset = cpu_to_le16(prdt_offset);
++		utrdlp->response_upiu_length = cpu_to_le16(ALIGNED_UPIU_SIZE);
++	} else {
++		utrdlp->response_upiu_offset = cpu_to_le16(response_offset >> 2);
++		utrdlp->prd_table_offset = cpu_to_le16(prdt_offset >> 2);
++		utrdlp->response_upiu_length = cpu_to_le16(ALIGNED_UPIU_SIZE >> 2);
++	}
+ 
+ 	hba->ucd_req_ptr = (struct utp_upiu_req *)hba->ucdl;
+ 	hba->ucd_rsp_ptr =
+@@ -749,6 +757,9 @@ static inline u32 ufshcd_get_ufs_version(struct ufs_hba *hba)
+  */
+ static inline u8 ufshcd_get_upmcrs(struct ufs_hba *hba)
+ {
++	if (hba->ops && hba->ops->get_upmcrs)
++		return hba->ops->get_upmcrs(hba);
++
+ 	return (ufshcd_readl(hba, REG_CONTROLLER_STATUS) >> 8) & 0x7;
+ }
+ 
+@@ -1034,6 +1045,7 @@ static int ufshcd_exec_dev_cmd(struct ufs_hba *hba, enum dev_cmd_type cmd_type,
+ 	if (err)
+ 		return err;
+ 
++	ufshcd_ops_setup_xfer_req(hba, TASK_TAG, false);
+ 	err = ufshcd_send_command(hba, TASK_TAG);
+ 	if (err)
+ 		return err;
+@@ -1545,6 +1557,7 @@ static int ufshcd_uic_pwr_ctrl(struct ufs_hba *hba, struct uic_command *cmd)
+ 	u8 status;
+ 	int ret;
+ 
++	hba->uic_power_mode_seen = false;
+ 	ret = ufshcd_send_uic_cmd(hba, cmd);
+ 	if (ret) {
+ 		dev_err(hba->dev,
+@@ -1554,6 +1567,39 @@ static int ufshcd_uic_pwr_ctrl(struct ufs_hba *hba, struct uic_command *cmd)
+ 		return ret;
+ 	}
+ 
++	/*
++	 * Hosts with their own result register report the outcome only once
++	 * the power mode change is done: wait for its completion first.
++	 */
++	if (hba->ops && hba->ops->get_upmcrs) {
++		start = get_timer(0);
++		while (!hba->uic_power_mode_seen) {
++			u32 intr_status = ufshcd_readl(hba, REG_INTERRUPT_STATUS);
++
++			if (intr_status & UIC_POWER_MODE) {
++				ufshcd_writel(hba, UIC_POWER_MODE,
++					      REG_INTERRUPT_STATUS);
++				break;
++			}
++			if (get_timer(start) > UFS_UIC_CMD_TIMEOUT) {
++				dev_err(hba->dev,
++					"pwr ctrl cmd 0x%x: no completion\n",
++					cmd->command);
++				return -ETIMEDOUT;
++			}
++		}
++
++		status = ufshcd_get_upmcrs(hba);
++		if (status != PWR_LOCAL) {
++			dev_err(hba->dev,
++				"pwr ctrl cmd 0x%x failed, host upmcrs:0x%x\n",
++				cmd->command, status);
++			return status;
++		}
++
++		return 0;
++	}
++
+ 	start = get_timer(0);
+ 	do {
+ 		status = ufshcd_get_upmcrs(hba);
+@@ -1640,19 +1686,23 @@ static void prepare_prdt_table(struct ufs_hba *hba, struct scsi_cmd *pccb)
+ 		return;
+ 	}
+ 
+-	table_length = DIV_ROUND_UP(pccb->datalen, MAX_PRDT_ENTRY);
++	table_length = DIV_ROUND_UP(pccb->datalen, hba->max_prdt_entry_size);
+ 	buf = pccb->pdata;
+ 	i = table_length;
+ 	while (--i) {
+ 		prepare_prdt_desc(hba, &prd_table[table_length - i - 1], buf,
+-				  MAX_PRDT_ENTRY - 1);
+-		buf += MAX_PRDT_ENTRY;
+-		datalen -= MAX_PRDT_ENTRY;
++				  hba->max_prdt_entry_size - 1);
++		buf += hba->max_prdt_entry_size;
++		datalen -= hba->max_prdt_entry_size;
+ 	}
+ 
+ 	prepare_prdt_desc(hba, &prd_table[table_length - i - 1], buf, datalen - 1);
+ 
+-	req_desc->prd_table_length = table_length;
++	if (hba->quirks & UFSHCD_QUIRK_PRDT_BYTE_GRAN)
++		req_desc->prd_table_length =
++			cpu_to_le16(table_length * sizeof(*prd_table));
++	else
++		req_desc->prd_table_length = cpu_to_le16(table_length);
+ 	ufshcd_cache_flush(prd_table, sizeof(*prd_table) * table_length);
+ 	ufshcd_cache_flush(req_desc, sizeof(*req_desc));
+ }
+@@ -1689,11 +1739,26 @@ static int ufs_scsi_exec(struct udevice *scsi_dev, struct scsi_cmd *pccb)
+ 
+ 	ufshcd_cache_flush(pccb->pdata, pccb->datalen);
+ 
++	ufshcd_ops_setup_xfer_req(hba, TASK_TAG, true);
+ 	ufshcd_send_command(hba, TASK_TAG);
+ 
+ 	ufshcd_cache_invalidate(pccb->pdata, pccb->datalen);
+ 
+ 	ocs = ufshcd_get_tr_ocs(hba);
++
++	/*
++	 * Some hosts report a fatal error for every response with a non-zero
++	 * response or status field (e.g. a CHECK CONDITION): the response
++	 * UPIU is valid then.
++	 */
++	if ((hba->quirks & UFSHCD_QUIRK_BROKEN_OCS_FATAL_ERROR) &&
++	    ocs == OCS_FATAL_ERROR) {
++		ufshcd_cache_invalidate(hba->ucd_rsp_ptr,
++					sizeof(*hba->ucd_rsp_ptr));
++		if (ufshcd_get_rsp_upiu_result(hba->ucd_rsp_ptr))
++			ocs = OCS_SUCCESS;
++	}
++
+ 	switch (ocs) {
+ 	case OCS_SUCCESS:
+ 		result = ufshcd_get_req_rsp(hba->ucd_rsp_ptr);
+@@ -2031,6 +2096,10 @@ static int ufshcd_change_power_mode(struct ufs_hba *hba,
+ 		return 0;
+ 	}
+ 
++	ret = ufshcd_ops_pwr_change_notify(hba, PRE_CHANGE, pwr_mode);
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * Configure attributes for power mode change with below.
+ 	 * - PA_RXGEAR, PA_ACTIVERXDATALANES, PA_RXTERMINATION,
+@@ -2073,7 +2142,7 @@ static int ufshcd_change_power_mode(struct ufs_hba *hba,
+ 	/* Copy new Power Mode to power info */
+ 	memcpy(&hba->pwr_info, pwr_mode, sizeof(struct ufs_pa_layer_attr));
+ 
+-	return ret;
++	return ufshcd_ops_pwr_change_notify(hba, POST_CHANGE, pwr_mode);
+ }
+ 
+ /**
+@@ -2213,10 +2282,10 @@ int ufshcd_probe(struct udevice *ufs_dev, struct ufs_hba_ops *hba_ops)
+ 	scsi_plat = dev_get_uclass_plat(scsi_dev);
+ 	scsi_plat->max_id = UFSHCD_MAX_ID;
+ 	scsi_plat->max_lun = UFS_MAX_LUNS;
+-	scsi_plat->max_bytes_per_req = UFS_MAX_BYTES;
+ 
+ 	hba->dev = ufs_dev;
+ 	hba->ops = hba_ops;
++	hba->max_prdt_entry_size = MAX_PRDT_ENTRY;
+ 
+ 	if (device_is_on_pci_bus(ufs_dev)) {
+ 		mmio_base = dm_pci_map_bar(ufs_dev, PCI_BASE_ADDRESS_0, 0, 0,
+@@ -2235,6 +2304,8 @@ int ufshcd_probe(struct udevice *ufs_dev, struct ufs_hba_ops *hba_ops)
+ 		return err;
+ 	}
+ 
++	scsi_plat->max_bytes_per_req = MAX_BUFF * hba->max_prdt_entry_size;
++
+ 	/* Read capabilities registers */
+ 	hba->capabilities = ufshcd_readl(hba, REG_CONTROLLER_CAPABILITIES);
+ 	if (hba->quirks & UFSHCD_QUIRK_BROKEN_64BIT_ADDRESS)
+@@ -2299,9 +2370,9 @@ int ufshcd_probe(struct udevice *ufs_dev, struct ufs_hba_ops *hba_ops)
+ #if IS_ENABLED(CONFIG_BOUNCE_BUFFER)
+ static int ufs_scsi_buffer_aligned(struct udevice *scsi_dev, struct bounce_buffer *state)
+ {
+-#ifdef CONFIG_PHYS_64BIT
+ 	struct ufs_hba *hba = dev_get_uclass_priv(scsi_dev->parent);
+ 	uintptr_t ubuf = (uintptr_t)state->user_buffer;
++#ifdef CONFIG_PHYS_64BIT
+ 	size_t len = state->len_aligned;
+ 
+ 	/* Check if below 32bit boundary */
+@@ -2312,6 +2383,9 @@ static int ufs_scsi_buffer_aligned(struct udevice *scsi_dev, struct bounce_buffe
+ 		return 0;
+ 	}
+ #endif
++	if (hba->dma_align && !IS_ALIGNED(ubuf, hba->dma_align))
++		return 0;
++
+ 	return 1;
+ }
+ #endif	/* CONFIG_BOUNCE_BUFFER */
+diff --git a/drivers/ufs/ufs.h b/drivers/ufs/ufs.h
+index 9f5573560..1cf6a7608 100644
+--- a/drivers/ufs/ufs.h
++++ b/drivers/ufs/ufs.h
+@@ -531,6 +531,11 @@ struct ufs_hba_ops {
+ 				   enum ufs_notify_change_status);
+ 	int (*phy_initialization)(struct ufs_hba *hba);
+ 	int (*device_reset)(struct ufs_hba *hba);
++	int (*pwr_change_notify)(struct ufs_hba *hba,
++				 enum ufs_notify_change_status status,
++				 struct ufs_pa_layer_attr *pwr_mode);
++	void (*setup_xfer_req)(struct ufs_hba *hba, int tag, bool is_scsi_cmd);
++	u8 (*get_upmcrs)(struct ufs_hba *hba);
+ };
+ 
+ enum ufshcd_quirks {
+@@ -722,6 +727,16 @@ struct ufs_hba {
+ 	struct ufs_pwr_mode_info max_pwr_info;
+ 
+ 	struct ufs_dev_cmd dev_cmd;
++
++	/*
++	 * Largest data segment of one PRDT entry, and the alignment of the
++	 * data buffers. Host drivers may lower or set them in their init().
++	 */
++	u32 max_prdt_entry_size;
++	u32 dma_align;
++
++	/* a UIC power mode completion was acknowledged */
++	bool uic_power_mode_seen;
+ };
+ 
+ static inline int ufshcd_ops_init(struct ufs_hba *hba)
+@@ -775,6 +790,23 @@ static inline int ufshcd_vops_device_reset(struct ufs_hba *hba)
+ 	return 0;
+ }
+ 
++static inline int ufshcd_ops_pwr_change_notify(struct ufs_hba *hba,
++					       enum ufs_notify_change_status status,
++					       struct ufs_pa_layer_attr *pwr_mode)
++{
++	if (hba->ops && hba->ops->pwr_change_notify)
++		return hba->ops->pwr_change_notify(hba, status, pwr_mode);
++
++	return 0;
++}
++
++static inline void ufshcd_ops_setup_xfer_req(struct ufs_hba *hba, int tag,
++					     bool is_scsi_cmd)
++{
++	if (hba->ops && hba->ops->setup_xfer_req)
++		hba->ops->setup_xfer_req(hba, tag, is_scsi_cmd);
++}
++
+ /* Interrupt disable masks */
+ enum {
+ 	/* Interrupt disable mask for UFSHCI v1.0 */
+-- 
+2.56.0
+

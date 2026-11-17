@@ -1,0 +1,1388 @@
+From 15b40b8ad608d6eef1b09801e6890990f3856f34 Mon Sep 17 00:00:00 2001
+From: proshiv85-byte <proshiv85@gmail.com>
+Date: Tue, 17 Nov 2026 20:13:16 +0200
+Subject: [PATCH 6/6] board: samsung: add the Galaxy S8+ (dream2lte)
+
+U-Boot as the kernel of the boot image in BOOT, chainloaded by S-Boot
+(which loads it at a random address: position independent).
+
+- display: the bootloader framebuffer, kept refreshing (DECON trigger)
+- UFS, extlinux from the USERDATA partition; the kernel DT keeps its
+  memory node (no EFI, no memory fixup)
+- keys: boot menu on Volume Down, Bixby held 5 s reboots into TWRP
+- USB: fastboot, mass storage, CDC ACM; the MAX77865 MUIC is switched
+  to the SoC over HSI2C_32 (USI13 put in I2C mode)
+- reboot into S-Boot's modes (reboot recovery/download), fastboot
+  reboot reasons
+- chainload: the original kernel of a boot image carried after U-Boot
+  (tools/d2l-bootimg.py), entered as S-Boot would
+- console mirrored into the ramoops zone (no reachable UART), read back
+  from TWRP or Linux pstore
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm/dts/Makefile                     |   1 +
+ arch/arm/dts/exynos8895-dream2lte.dts     | 223 ++++++++
+ arch/arm/mach-exynos/Kconfig              |  16 +-
+ board/samsung/dream2lte/Kconfig           |  38 ++
+ board/samsung/dream2lte/Makefile          |   4 +
+ board/samsung/dream2lte/dream2lte.c       | 653 ++++++++++++++++++++++
+ board/samsung/dream2lte/dream2lte.env     |  51 ++
+ board/samsung/dream2lte/entry.S           |  42 ++
+ board/samsung/dream2lte/ramoops-console.c | 120 ++++
+ configs/dream2lte_defconfig               |  92 +++
+ include/configs/dream2lte.h               |  11 +
+ 11 files changed, 1250 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm/dts/exynos8895-dream2lte.dts
+ create mode 100644 board/samsung/dream2lte/Kconfig
+ create mode 100644 board/samsung/dream2lte/Makefile
+ create mode 100644 board/samsung/dream2lte/dream2lte.c
+ create mode 100644 board/samsung/dream2lte/dream2lte.env
+ create mode 100644 board/samsung/dream2lte/entry.S
+ create mode 100644 board/samsung/dream2lte/ramoops-console.c
+ create mode 100644 configs/dream2lte_defconfig
+ create mode 100644 include/configs/dream2lte.h
+
+diff --git a/arch/arm/dts/Makefile b/arch/arm/dts/Makefile
+index 22f10c8ec..74505cf4f 100644
+--- a/arch/arm/dts/Makefile
++++ b/arch/arm/dts/Makefile
+@@ -32,6 +32,7 @@ dtb-$(CONFIG_EXYNOS7420) += exynos7420-espresso7420.dtb
+ dtb-$(CONFIG_TARGET_A5Y17LTE) += exynos78x0-axy17lte.dtb
+ dtb-$(CONFIG_TARGET_A3Y17LTE) += exynos78x0-axy17lte.dtb
+ dtb-$(CONFIG_TARGET_A7Y17LTE) += exynos78x0-axy17lte.dtb
++dtb-$(CONFIG_TARGET_DREAM2LTE) += exynos8895-dream2lte.dtb
+ 
+ dtb-$(CONFIG_ARCH_DAVINCI) += \
+ 	da850-lcdk.dtb \
+diff --git a/arch/arm/dts/exynos8895-dream2lte.dts b/arch/arm/dts/exynos8895-dream2lte.dts
+new file mode 100644
+index 000000000..51a9a496c
+--- /dev/null
++++ b/arch/arm/dts/exynos8895-dream2lte.dts
+@@ -0,0 +1,223 @@
++// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
++/*
++ * Samsung Galaxy S8+ (dream2lte/SM-G955F) device tree source for U-Boot
++ *
++ * Based on the upstream exynos8895-dreamlte.dts,
++ * Copyright (c) 2024, Ivaylo Ivanov <ivo.ivanov.ivanov1@gmail.com>
++ *
++ * There is no clock driver for the Exynos 8895 in U-Boot: the clocks
++ * stay as the bootloader set them up, and the UFS host gets their rates
++ * from fixed clocks.
++ */
++
++/dts-v1/;
++#include "exynos8895.dtsi"
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++
++/ {
++	model = "Samsung Galaxy S8+ (SM-G955F)";
++	compatible = "samsung,dream2lte", "samsung,exynos8895";
++	chassis-type = "handset";
++
++	chosen {
++		#address-cells = <2>;
++		#size-cells = <1>;
++		ranges;
++
++		framebuffer: framebuffer@cc000000 {
++			compatible = "simple-framebuffer";
++			reg = <0 0xcc000000 (1440 * 2960 * 4)>;
++			width = <1440>;
++			height = <2960>;
++			stride = <(1440 * 4)>;
++			format = "a8r8g8b8";
++			bootph-all;
++		};
++	};
++
++	memory@80000000 {
++		device_type = "memory";
++		reg = <0x0 0x80000000 0x3c800000>,
++		      <0x0 0xc0000000 0x40000000>,
++		      <0x8 0x80000000 0x80000000>;
++	};
++
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <1>;
++		ranges;
++
++		ramoops@92000000 {
++			compatible = "ramoops";
++			reg = <0 0x92000000 0x8000>;
++			record-size = <0x4000>;
++			console-size = <0x4000>;
++		};
++
++		tima@b1000000 {
++			reg = <0 0xb1000000 0x200000>;
++			no-map;
++		};
++
++		seclog@c0000000 {
++			reg = <0 0xc0000000 0x10000>;
++			no-map;
++		};
++
++		cont_splash_mem: framebuffer@cc000000 {
++			reg = <0 0xcc000000 (1440 * 2960 * 4)>;
++			no-map;
++		};
++	};
++
++	gpio-keys {
++		compatible = "gpio-keys";
++
++		pinctrl-0 = <&key_power &key_voldown &key_volup &key_wink>;
++		pinctrl-names = "default";
++
++		power-key {
++			label = "Power";
++			linux,code = <KEY_POWER>;
++			gpios = <&gpa2 4 GPIO_ACTIVE_LOW>;
++		};
++
++		voldown-key {
++			label = "Volume Down";
++			linux,code = <KEY_VOLUMEDOWN>;
++			gpios = <&gpa0 4 GPIO_ACTIVE_LOW>;
++		};
++
++		volup-key {
++			label = "Volume Up";
++			linux,code = <KEY_VOLUMEUP>;
++			gpios = <&gpa0 3 GPIO_ACTIVE_LOW>;
++		};
++
++		/* Bixby */
++		wink-key {
++			label = "Bixby";
++			linux,code = <KEY_CAMERA>;
++			gpios = <&gpa0 6 GPIO_ACTIVE_LOW>;
++		};
++	};
++
++	/* PCLK of USI13 (HSI2C_32), 66.625 MHz from CMU_PERIC1 */
++	usi13_pclk: clock-usi13-pclk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <66625000>;
++		clock-output-names = "usi13_pclk";
++	};
++
++	/* 166.5625 MHz from CMU_FSYS0, as left by S-Boot */
++	ufs_aclk: clock-ufs-aclk {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <166562500>;
++		clock-output-names = "ufs_embd_aclk";
++	};
++
++	ufs_unipro_clk: clock-ufs-unipro {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <166562500>;
++		clock-output-names = "ufs_embd_unipro";
++	};
++};
++
++/*
++ * USI13 is in I2C mode for the MAX77865 (charger, fuel gauge, MUIC) from
++ * S-Boot; there is no USI v1 driver, the bus just exposes the controller.
++ */
++&usi13 {
++	compatible = "samsung,exynos8895-usi", "simple-bus";
++	status = "okay";
++};
++
++&hsi2c_32 {
++	clocks = <&usi13_pclk>;
++	clock-frequency = <400000>;
++	status = "okay";
++};
++
++&pinctrl_alive {
++	key_power: key-power-pins {
++		samsung,pins = "gpa2-4";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS7_PIN_DRV_LV1>;
++	};
++
++	key_voldown: key-voldown-pins {
++		samsung,pins = "gpa0-4";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS7_PIN_DRV_LV1>;
++	};
++
++	key_volup: key-volup-pins {
++		samsung,pins = "gpa0-3";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS7_PIN_DRV_LV1>;
++	};
++
++	key_wink: key-wink-pins {
++		samsung,pins = "gpa0-6";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
++		samsung,pin-drv = <EXYNOS7_PIN_DRV_LV1>;
++	};
++};
++
++&soc {
++	ufs: ufs@11120000 {
++		compatible = "samsung,exynos8895-ufs";
++		reg = <0x11120000 0x200>,
++		      <0x11121100 0x200>,
++		      <0x11110000 0x8000>,
++		      <0x11130000 0x100>;
++		reg-names = "hci", "vs_hci", "unipro", "ufsp";
++		clocks = <&ufs_aclk>, <&ufs_unipro_clk>;
++		clock-names = "core_clk", "sclk_unipro_main";
++		dma-coherent;
++		phys = <&ufs_phy>;
++		phy-names = "ufs-phy";
++		samsung,sysreg = <&syscon_fsys0 0x700>;
++	};
++
++	usbdrd: usb@10c00000 {
++		compatible = "samsung,exynos8895-dwusb3";
++		ranges = <0x0 0x10c00000 0x10000>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++
++		usbdrd_dwc3: usb@0 {
++			compatible = "snps,dwc3";
++			reg = <0x0 0x10000>;
++			phys = <&usbdrd_phy 0>;
++			phy-names = "usb2-phy";
++			dr_mode = "peripheral";
++			maximum-speed = "high-speed";
++		};
++	};
++
++	usbdrd_phy: phy@10e00000 {
++		compatible = "samsung,exynos8895-usbdrd-phy";
++		reg = <0x10e00000 0x100>,
++		      <0x10e10000 0x100>,
++		      <0x10e50070 0x10>;
++		samsung,pmu-syscon = <&pmu_system_controller>;
++		#phy-cells = <1>;
++	};
++
++	ufs_phy: phy@11124000 {
++		compatible = "samsung,exynos8895-ufs-phy";
++		reg = <0x11124000 0x800>;
++		reg-names = "phy-pma";
++		samsung,pmu-syscon = <&pmu_system_controller>;
++		#phy-cells = <0>;
++	};
++};
+diff --git a/arch/arm/mach-exynos/Kconfig b/arch/arm/mach-exynos/Kconfig
+index b084b7284..8c9fb0831 100644
+--- a/arch/arm/mach-exynos/Kconfig
++++ b/arch/arm/mach-exynos/Kconfig
+@@ -2,7 +2,8 @@ if ARCH_EXYNOS
+ 
+ config BOARD_COMMON
+ 	def_bool y
+-	depends on !TARGET_SMDKV310 && !TARGET_ARNDALE && !TARGET_EXYNOS_MOBILE && !TARGET_E850_96
++	depends on !TARGET_SMDKV310 && !TARGET_ARNDALE && !TARGET_EXYNOS_MOBILE && \
++		   !TARGET_E850_96 && !TARGET_DREAM2LTE
+ 
+ config SPI_BOOTING
+ 	bool
+@@ -260,6 +261,18 @@ config TARGET_EXYNOS_MOBILE
+ 	select LINUX_KERNEL_IMAGE_HEADER
+ 	select OF_CONTROL
+ 
++config TARGET_DREAM2LTE
++	bool "Samsung Galaxy S8/S8+ (Exynos 8895)"
++	select ARM64
++	select BOARD_EARLY_INIT_F
++	select LINUX_KERNEL_IMAGE_HEADER
++	select OF_CONTROL
++	help
++	  Support for the Samsung Galaxy S8 (dreamlte) and S8+ (dream2lte)
++	  with the Exynos 8895 SoC. U-Boot is chainloaded by the stock
++	  Samsung bootloader (S-Boot) from the BOOT partition, packed as the
++	  kernel of an Android boot image.
++
+ config SYS_SOC
+ 	default "exynos"
+ 
+@@ -286,5 +299,6 @@ source "board/samsung/espresso7420/Kconfig"
+ source "board/samsung/axy17lte/Kconfig"
+ source "board/samsung/e850-96/Kconfig"
+ source "board/samsung/exynos-mobile/Kconfig"
++source "board/samsung/dream2lte/Kconfig"
+ 
+ endif
+diff --git a/board/samsung/dream2lte/Kconfig b/board/samsung/dream2lte/Kconfig
+new file mode 100644
+index 000000000..92b010cb8
+--- /dev/null
++++ b/board/samsung/dream2lte/Kconfig
+@@ -0,0 +1,38 @@
++if TARGET_DREAM2LTE
++
++config SYS_BOARD
++	default "dream2lte"
++
++config SYS_VENDOR
++	default "samsung"
++
++config SYS_CONFIG_NAME
++	default "dream2lte"
++
++config ENV_SOURCE_FILE
++	default "dream2lte"
++
++# text_offset 0x80000 like the vendor kernel. S-Boot loads the kernel at a
++# random address (Samsung KASLR), U-Boot is position independent for that.
++config LNX_KRNL_IMG_TEXT_OFFSET_BASE
++	default 0x80000000
++
++config DREAM2LTE_RAMOOPS_CONSOLE
++	bool "Mirror the console into the ramoops console zone"
++	default y
++	help
++	  Write all console output into the ramoops console zone at
++	  0x92004000 (the "log_pstore" area of the vendor kernel). The
++	  phone has no accessible UART: after a reset into TWRP the log is
++	  /sys/fs/pstore/pmsg-ramoops-0, and a mainline kernel with the
++	  same ramoops layout shows it as console-ramoops-0.
++
++config DREAM2LTE_DEV_RECOVERY
++	bool "Preset the reboot reason to recovery (development)"
++	help
++	  Set the Samsung reboot reason to "recovery" as early as possible,
++	  so that a hang (forced reset) or a crash of U-Boot ends up in TWRP
++	  instead of boot looping. U-Boot sets it back to "normal" before
++	  it boots an OS, unless the environment variable dev_recovery is 1.
++
++endif
+diff --git a/board/samsung/dream2lte/Makefile b/board/samsung/dream2lte/Makefile
+new file mode 100644
+index 000000000..94afb340d
+--- /dev/null
++++ b/board/samsung/dream2lte/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0+
++
++obj-y := dream2lte.o entry.o
++obj-$(CONFIG_DREAM2LTE_RAMOOPS_CONSOLE) += ramoops-console.o
+diff --git a/board/samsung/dream2lte/dream2lte.c b/board/samsung/dream2lte/dream2lte.c
+new file mode 100644
+index 000000000..260a6c953
+--- /dev/null
++++ b/board/samsung/dream2lte/dream2lte.c
+@@ -0,0 +1,653 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Samsung Galaxy S8/S8+ (Exynos 8895) board support
++ *
++ * U-Boot is the "kernel" of an Android boot image in the BOOT partition.
++ * The stock bootloader (S-Boot) copies it to 0x80080000 and enters it
++ * with the MMU off, with a DTB of its own at 0x8a000000 (x0) whose
++ * bootargs carry the boot mode and the serial number. The display is
++ * left running from the framebuffer at 0xcc000000.
++ */
++
++#include <bootm.h>
++#include <command.h>
++#include <cpu_func.h>
++#include <cyclic.h>
++#include <dm.h>
++#include <env.h>
++#include <fastboot.h>
++#include <fdt_support.h>
++#include <i2c.h>
++#include <init.h>
++#include <log.h>
++#include <asm/armv8/mmu.h>
++#include <asm/cache.h>
++#include <asm/global_data.h>
++#include <asm/io.h>
++#include <asm/system.h>
++#include <dm/ofnode.h>
++#include <dm/root.h>
++#include <u-boot/crc.h>
++#include <linux/libfdt.h>
++#include <linux/sizes.h>
++#include <sysreset.h>
++#include <time.h>
++
++DECLARE_GLOBAL_DATA_PTR;
++
++/* DECON-F: hardware/software trigger control of the command mode panel */
++#define DECON_F_HW_SW_TRIG	0x12860070
++#define DECON_TRIG_VAL		0x1281
++
++/* PMU INFORM registers: S-Boot reads the reboot reason from them */
++#define PMU_BASE		0x16480000
++#define PMU_INFORM2		(PMU_BASE + 0x808)
++#define PMU_INFORM3		(PMU_BASE + 0x80c)
++#define SEC_POWER_RESET		0x12345678
++#define SEC_REASON_NORMAL	0x12345670
++#define SEC_REASON_DOWNLOAD	0x12345671
++#define SEC_REASON_RECOVERY	0x12345674
++#define SEC_REASON_BOOTLOADER	0x1234567d
++
++/* PMU: software reset and the PS_HOLD output that keeps the PMIC on */
++#define PMU_SWRESET		(PMU_BASE + 0x400)
++#define PMU_PS_HOLD_CONTROL	(PMU_BASE + 0x330c)
++#define PS_HOLD_DATA		BIT(8)
++
++/* the DTB S-Boot hands over, if x0 doesn't point to one */
++#define SBOOT_FDT_ADDR		0x8a000000
++
++/*
++ * CMU_FSYS0 gates of the USB 3.0 DRD controller: S-Boot leaves them under
++ * automatic (Q-channel) gating, Linux and U-Boot switch them to manual.
++ */
++#define CMU_FSYS0_BASE		0x11000000
++#define CMU_GATE_USB30DRD_ACLK	(CMU_FSYS0_BASE + 0x2078)
++#define CMU_GATE_USB30DRD_REF	(CMU_FSYS0_BASE + 0x207c)
++#define CMU_GATE_USB30DRD_SUSP	(CMU_FSYS0_BASE + 0x2080)
++#define CMU_GATE_ENABLE_HWACG	BIT(28)
++#define CMU_GATE_CG_VALUE	BIT(21)
++#define CMU_GATE_MANUAL		BIT(20)
++
++/*
++ * A boot mode for the next U-Boot start ("fastboot" after a fastboot
++ * reboot-bootloader), in DRAM after the ramoops zone. Like the log it
++ * survives a reset, and the board maps it uncached.
++ */
++#define D2L_REBOOT_MODE_ADDR	0x92008000UL
++#define D2L_REBOOT_MODE_MAGIC	0x4d4c3244	/* "D2LM" */
++
++struct d2l_reboot_mode {
++	u32 magic;
++	char mode[28];
++};
++
++#define FB_BASE			0xcc000000UL
++#define FB_SIZE			(1440 * 2960 * 4)
++
++/*
++ * DRAM is mapped where U-Boot may use it: the first bank without the TIMA
++ * carve-out (accessing it faults) and with the ramoops zone uncached.
++ * The second bank is full of secure carve-outs and holds only the
++ * framebuffer for U-Boot. The third bank (above 4 GiB) is left to Linux.
++ */
++static struct mm_region dream2lte_mem_map[] = {
++	{
++		/* peripherals */
++		.virt = 0x10000000UL,
++		.phys = 0x10000000UL,
++		.size = 0x10000000UL,
++		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
++			 PTE_BLOCK_NON_SHARE | PTE_BLOCK_PXN | PTE_BLOCK_UXN,
++	}, {
++		.virt = 0x80000000UL,
++		.phys = 0x80000000UL,
++		.size = 0x12000000UL,
++		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) | PTE_BLOCK_INNER_SHARE,
++	}, {
++		/* ramoops and the vendor kernel's log buffers */
++		.virt = 0x92000000UL,
++		.phys = 0x92000000UL,
++		.size = 0x00200000UL,
++		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) | PTE_BLOCK_INNER_SHARE |
++			 PTE_BLOCK_PXN | PTE_BLOCK_UXN,
++	}, {
++		.virt = 0x92200000UL,
++		.phys = 0x92200000UL,
++		.size = 0xb1000000UL - 0x92200000UL,
++		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) | PTE_BLOCK_INNER_SHARE,
++	}, {
++		/* 0xb1000000-0xb1200000: TIMA */
++		.virt = 0xb1200000UL,
++		.phys = 0xb1200000UL,
++		.size = 0xbc800000UL - 0xb1200000UL,
++		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) | PTE_BLOCK_INNER_SHARE,
++	}, {
++		.virt = FB_BASE,
++		.phys = FB_BASE,
++		.size = ALIGN(FB_SIZE, SZ_2M),
++		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) | PTE_BLOCK_INNER_SHARE |
++			 PTE_BLOCK_PXN | PTE_BLOCK_UXN,
++	}, {
++		/* list terminator */
++	},
++};
++
++struct mm_region *mem_map = dream2lte_mem_map;
++
++/* a reboot reason was chosen for the next reset (reboot <mode>, fastboot) */
++static bool sboot_reason_set;
++
++static void sboot_set_reason(u32 reason)
++{
++	writel(SEC_POWER_RESET, PMU_INFORM2);
++	writel(reason, PMU_INFORM3);
++	sboot_reason_set = true;
++}
++
++int board_early_init_f(void)
++{
++	/* keep the panel refreshing from the bootloader framebuffer */
++	writel(DECON_TRIG_VAL, DECON_F_HW_SW_TRIG);
++
++	return 0;
++}
++
++int timer_init(void)
++{
++	/* S-Boot doesn't set CNTFRQ_EL0, the counter runs at 26 MHz */
++	gd->arch.timer_rate_hz = CONFIG_COUNTER_FREQUENCY;
++
++	return 0;
++}
++
++int dram_init(void)
++{
++	return fdtdec_setup_mem_size_base();
++}
++
++int dram_init_banksize(void)
++{
++	return fdtdec_setup_memory_banksize();
++}
++
++static void cmu_gate_enable(ulong reg)
++{
++	clrsetbits_le32(reg, CMU_GATE_ENABLE_HWACG,
++			CMU_GATE_MANUAL | CMU_GATE_CG_VALUE);
++}
++
++int board_init(void)
++{
++	/* there is no clock driver: the USB controller's clocks run */
++	cmu_gate_enable(CMU_GATE_USB30DRD_ACLK);
++	cmu_gate_enable(CMU_GATE_USB30DRD_REF);
++	cmu_gate_enable(CMU_GATE_USB30DRD_SUSP);
++
++	return 0;
++}
++
++/* x0 at entry, saved by entry.S */
++extern ulong sboot_x0;
++
++static const void *sboot_fdt(void)
++{
++	const void *fdt = (const void *)sboot_x0;
++
++	if (fdt && !fdt_check_header(fdt))
++		return fdt;
++
++	fdt = (const void *)SBOOT_FDT_ADDR;
++	if (!fdt_check_header(fdt))
++		return fdt;
++
++	return NULL;
++}
++
++/* the value of @key= in S-Boot's bootargs, copied into @buf */
++static int sboot_bootarg(const void *fdt, const char *key, char *buf,
++			 size_t len)
++{
++	const char *args, *p, *end;
++	size_t klen = strlen(key);
++	int node, alen;
++
++	node = fdt_path_offset(fdt, "/chosen");
++	if (node < 0)
++		return -ENOENT;
++	args = fdt_getprop(fdt, node, "bootargs", &alen);
++	if (!args)
++		return -ENOENT;
++
++	for (p = args; p && *p; p = strchr(p, ' ')) {
++		while (*p == ' ')
++			p++;
++		if (strncmp(p, key, klen) || p[klen] != '=')
++			continue;
++		p += klen + 1;
++		end = p;
++		while (*end && *end != ' ')
++			end++;
++		if (end - p >= len)
++			return -E2BIG;
++		memcpy(buf, p, end - p);
++		buf[end - p] = '\0';
++		return 0;
++	}
++
++	return -ENOENT;
++}
++
++static void d2l_set_reboot_mode(const char *mode)
++{
++	struct d2l_reboot_mode *rm = (void *)D2L_REBOOT_MODE_ADDR;
++
++	strlcpy(rm->mode, mode, sizeof(rm->mode));
++	rm->magic = D2L_REBOOT_MODE_MAGIC;
++}
++
++/* the reboot mode U-Boot left for itself, into $d2l_reboot_mode */
++static void d2l_get_reboot_mode(void)
++{
++	struct d2l_reboot_mode *rm = (void *)D2L_REBOOT_MODE_ADDR;
++
++	if (rm->magic == D2L_REBOOT_MODE_MAGIC) {
++		rm->mode[sizeof(rm->mode) - 1] = '\0';
++		env_set("d2l_reboot_mode", rm->mode);
++	}
++	rm->magic = 0;
++}
++
++int fastboot_set_reboot_flag(enum fastboot_reboot_reason reason)
++{
++	switch (reason) {
++	case FASTBOOT_REBOOT_REASON_BOOTLOADER:
++		sboot_set_reason(SEC_REASON_NORMAL);
++		d2l_set_reboot_mode("fastboot");
++		return 0;
++	case FASTBOOT_REBOOT_REASON_RECOVERY:
++		sboot_set_reason(SEC_REASON_RECOVERY);
++		return 0;
++	default:
++		return -ENOSYS;
++	}
++}
++
++/*
++ * Holding Bixby for 5 seconds reboots into TWRP, wherever U-Boot is: also
++ * in fastboot, mass storage mode or a menu. The key is read directly
++ * (GPA0-6 in the ALIVE pin controller, low when pressed), so this works
++ * whatever the GPIO driver did to the pin.
++ */
++#define GPA0_DAT		0x164b0024
++#define BIXBY_BIT		BIT(6)
++#define BIXBY_HOLD_MS		5000
++
++static struct cyclic_info bixby_cyclic;
++static ulong bixby_pressed_at;
++
++static void bixby_poll(struct cyclic_info *c)
++{
++	if (readl(GPA0_DAT) & BIXBY_BIT) {
++		bixby_pressed_at = 0;
++		return;
++	}
++
++	if (!bixby_pressed_at) {
++		bixby_pressed_at = get_timer(0) ?: 1;
++		return;
++	}
++
++	if (get_timer(bixby_pressed_at) >= BIXBY_HOLD_MS) {
++		puts("\nBixby held: rebooting into recovery\n");
++		sboot_set_reason(SEC_REASON_RECOVERY);
++		writel(1, PMU_SWRESET);
++		for (;;)
++			;
++	}
++}
++
++/*
++ * A kernel of the original boot image, carried after U-Boot.
++ *
++ * tools/d2l-bootimg.py packs the kernel section of a boot image as
++ * U-Boot, padded to 2 MiB, this header (4 KiB) and the original kernel.
++ * S-Boot loads the whole section where it would load the original kernel
++ * (entry.S records the address), and the original ramdisk and DTB to their
++ * usual places, so "chainload" can enter the original kernel exactly as
++ * S-Boot would have.
++ */
++#define D2L_CHAIN_HDR_OFFSET	SZ_2M
++#define D2L_CHAIN_HDR_SIZE	4096
++#define D2L_CHAIN_MAGIC		"D2LCHAIN"
++#define D2L_CHAIN_VERSION	1
++#define D2L_CHAIN_F_DEFAULT	BIT(0)	/* boot it by default */
++/* up to S-Boot's ramdisk */
++#define D2L_CHAIN_END		0x89000000UL
++
++/* saved by entry.S */
++extern ulong sboot_load_addr;
++
++struct d2l_chain_hdr {
++	char magic[8];
++	__le32 version;
++	__le32 hdr_size;
++	__le64 size;
++	__le32 crc32;
++	__le32 flags;
++	char name[64];
++};
++
++static ulong d2l_chain_size;
++
++static void *d2l_chain_payload(void)
++{
++	return (void *)(sboot_load_addr + D2L_CHAIN_HDR_OFFSET +
++			D2L_CHAIN_HDR_SIZE);
++}
++
++static void d2l_find_chain(void)
++{
++	struct d2l_chain_hdr *hdr;
++	const u8 *payload = d2l_chain_payload();
++	char name[sizeof(hdr->name) + 1];
++	u64 size;
++
++	env_set_hex("d2l_load_addr", sboot_load_addr);
++	hdr = (void *)(sboot_load_addr + D2L_CHAIN_HDR_OFFSET);
++
++	if (memcmp(hdr->magic, D2L_CHAIN_MAGIC, sizeof(hdr->magic)))
++		return;
++	/* from RAM, not this boot's image: S-Boot loads it every time */
++	memset(hdr->magic, 0, sizeof(hdr->magic));
++
++	size = le64_to_cpu(hdr->size);
++	if (le32_to_cpu(hdr->version) != D2L_CHAIN_VERSION ||
++	    le32_to_cpu(hdr->hdr_size) != D2L_CHAIN_HDR_SIZE ||
++	    !size || (ulong)payload + size > D2L_CHAIN_END) {
++		log_warning("unusable boot image kernel after U-Boot\n");
++		return;
++	}
++	if (crc32(0, payload, size) != le32_to_cpu(hdr->crc32)) {
++		log_warning("boot image kernel after U-Boot: bad CRC\n");
++		return;
++	}
++
++	memcpy(name, hdr->name, sizeof(hdr->name));
++	name[sizeof(hdr->name)] = '\0';
++	d2l_chain_size = size;
++	env_set("d2l_chain_name", name[0] ? name : "boot.img kernel");
++	env_set_hex("d2l_chain_size", size);
++	if (le32_to_cpu(hdr->flags) & D2L_CHAIN_F_DEFAULT)
++		env_set("d2l_default", "chain");
++}
++
++static int do_chainload(struct cmd_tbl *cmdtp, int flag, int argc,
++			char *const argv[])
++{
++	const void *payload = d2l_chain_payload();
++	const void *fdt = sboot_fdt();
++	void (*entry)(ulong x0, ulong x1, ulong x2, ulong x3);
++
++	if (!d2l_chain_size) {
++		puts("No kernel after U-Boot in this boot image\n");
++		return CMD_RET_FAILURE;
++	}
++
++	printf("Starting %s ...\n\n", env_get("d2l_chain_name"));
++	board_preboot_os();
++	board_quiesce_devices();
++	dm_remove_devices_active();
++
++	/* where S-Boot put us; U-Boot runs from the top of RAM by now */
++	memmove((void *)sboot_load_addr, payload, d2l_chain_size);
++	flush_dcache_range(sboot_load_addr,
++			   ALIGN(sboot_load_addr + d2l_chain_size,
++				 ARCH_DMA_MINALIGN));
++
++	/* MMU and caches off, x0 = S-Boot's DTB: as S-Boot enters a kernel */
++	cleanup_before_linux();
++	entry = (void *)sboot_load_addr;
++	entry((ulong)fdt, 0, 0, 0);
++
++	return CMD_RET_FAILURE;
++}
++
++U_BOOT_CMD(chainload, 1, 0, do_chainload,
++	   "boot the original kernel of this boot image as S-Boot would",
++	   "");
++
++/* the boot menu, with the boot image's own kernel first when there is one */
++static void d2l_setup_menu(void)
++{
++	static const char * const entries[] = {
++		"Boot Linux (/boot/extlinux)=run boot_extlinux",
++		"Fastboot=run fastboot_mode",
++		"USB mass storage (UFS)=run ums_mode",
++		"U-Boot console on USB serial=run usb_console",
++		"Reboot=reboot",
++		"Reboot to recovery (TWRP)=reboot recovery",
++		"Reboot to download mode=reboot download",
++		"Power off=poweroff",
++	};
++	char name[16], buf[128];
++	int i, n = 0;
++
++	if (d2l_chain_size) {
++		snprintf(buf, sizeof(buf), "Boot %s=chainload",
++			 env_get("d2l_chain_name"));
++		env_set("bootmenu_0", buf);
++		n++;
++	}
++	for (i = 0; i < ARRAY_SIZE(entries); i++, n++) {
++		snprintf(name, sizeof(name), "bootmenu_%d", n);
++		env_set(name, entries[i]);
++	}
++}
++
++int misc_init_r(void)
++{
++	const void *fdt = sboot_fdt();
++	char buf[64];
++
++	d2l_get_reboot_mode();
++	d2l_find_chain();
++	d2l_setup_menu();
++
++	cyclic_register(&bixby_cyclic, bixby_poll, 100 * 1000, "bixby");
++
++	if (!fdt) {
++		log_warning("no DTB from S-Boot\n");
++		env_set("sboot_mode", "no-dtb");
++		return 0;
++	}
++
++	env_set_hex("prevbl_fdt_addr", (ulong)fdt);
++
++	/* "charger" when plugging in a cable powered the phone on */
++	if (!sboot_bootarg(fdt, "androidboot.mode", buf, sizeof(buf)))
++		env_set("sboot_mode", buf);
++	else
++		env_set("sboot_mode", "none");
++
++	if (!sboot_bootarg(fdt, "androidboot.serialno", buf, sizeof(buf)))
++		env_set("serial#", buf);
++
++	if (!sboot_bootarg(fdt, "androidboot.bootloader", buf, sizeof(buf)))
++		env_set("sboot_version", buf);
++
++	return 0;
++}
++
++int ft_board_setup(void *blob, struct bd_info *bd)
++{
++	const char *mode = env_get("sboot_mode");
++	int node;
++
++	/* the kernel's initramfs starts off-mode charging on "charger" */
++	node = fdt_path_offset(blob, "/chosen");
++	if (node >= 0 && mode &&
++	    fdt_getprop(blob, node, "dream2lte,sboot-mode", NULL))
++		fdt_setprop_string(blob, node, "dream2lte,sboot-mode", mode);
++
++	return 0;
++}
++
++void board_preboot_os(void)
++{
++	/*
++	 * A reset of the OS should boot it again. With dev_recovery=1 it
++	 * goes to TWRP instead, to look at its log there.
++	 */
++	if (env_get_yesno("dev_recovery") == 1)
++		sboot_set_reason(SEC_REASON_RECOVERY);
++	else
++		sboot_set_reason(SEC_REASON_NORMAL);
++}
++
++static int do_reboot(struct cmd_tbl *cmdtp, int flag, int argc,
++		     char *const argv[])
++{
++	u32 reason = SEC_REASON_NORMAL;
++
++	if (argc > 2)
++		return CMD_RET_USAGE;
++	if (argc == 2) {
++		if (!strcmp(argv[1], "recovery"))
++			reason = SEC_REASON_RECOVERY;
++		else if (!strcmp(argv[1], "download"))
++			reason = SEC_REASON_DOWNLOAD;
++		else if (!strcmp(argv[1], "bootloader"))
++			reason = SEC_REASON_BOOTLOADER;
++		else if (strcmp(argv[1], "normal"))
++			return CMD_RET_USAGE;
++	}
++
++	sboot_set_reason(reason);
++	do_reset(NULL, 0, 0, NULL);
++
++	return CMD_RET_FAILURE;
++}
++
++U_BOOT_CMD(reboot, 2, 0, do_reboot,
++	   "reboot the phone, into a Samsung boot mode",
++	   "[normal|recovery|download|bootloader]\n"
++	   "    recovery: TWRP (RECOVERY partition)\n"
++	   "    download: Odin download mode");
++
++/*
++ * Reset through the PMU, from the start: without a reset device before
++ * relocation, a panic would hang instead of resetting.
++ */
++static int dream2lte_sysreset_request(struct udevice *dev,
++				      enum sysreset_t type)
++{
++	switch (type) {
++	case SYSRESET_WARM:
++	case SYSRESET_COLD:
++		/*
++		 * A plain reset boots normally, whatever S-Boot or the
++		 * development preset left in INFORM3. Development builds keep
++		 * "recovery", for a panic to end up in TWRP.
++		 */
++		if (!sboot_reason_set && !IS_ENABLED(CONFIG_DREAM2LTE_DEV_RECOVERY))
++			sboot_set_reason(SEC_REASON_NORMAL);
++		writel(1, PMU_SWRESET);
++		break;
++	case SYSRESET_POWER_OFF:
++		/* with a charger attached, S-Boot starts off-mode charging */
++		clrbits_le32(PMU_PS_HOLD_CONTROL, PS_HOLD_DATA);
++		break;
++	default:
++		return -EPROTONOSUPPORT;
++	}
++
++	return -EINPROGRESS;
++}
++
++static struct sysreset_ops dream2lte_sysreset_ops = {
++	.request = dream2lte_sysreset_request,
++};
++
++U_BOOT_DRIVER(dream2lte_sysreset) = {
++	.name	= "dream2lte_sysreset",
++	.id	= UCLASS_SYSRESET,
++	.ops	= &dream2lte_sysreset_ops,
++	.flags	= DM_FLAG_PRE_RELOC,
++};
++
++U_BOOT_DRVINFO(dream2lte_sysreset) = {
++	.name = "dream2lte_sysreset",
++};
++
++/*
++ * The MUIC of the MAX77865 switches the connector's D+/D- lines, and S-Boot
++ * leaves the switch open: connect them to the SoC's USB PHY.
++ */
++#define MAX77865_MUIC_ADDR		0x25
++#define MAX77865_MUIC_REG_CONTROL1	0x19
++#define MAX77865_MUIC_COM_USB_AP	0x89
++
++/*
++ * S-Boot doesn't use USI13: its clocks are under automatic gating and no
++ * protocol is selected. Like the Linux CMU and USI (v1) drivers: gates on,
++ * then the second I2C controller of the USI (HSI2C_32) in its sysreg.
++ */
++#define CMU_TOP_BASE			0x15a80000
++#define CMU_GATE_CMU_PERIC1_USI13	(CMU_TOP_BASE + 0x20fc)
++#define CMU_PERIC1_BASE			0x10800000
++#define CMU_GATE_SYSREG_PERIC1_PCLK	(CMU_PERIC1_BASE + 0x2078)
++#define CMU_GATE_USI13_PCLK		(CMU_PERIC1_BASE + 0x20cc)
++#define CMU_GATE_USI13_SCLK		(CMU_PERIC1_BASE + 0x20d0)
++#define SYSREG_PERIC1_USI13_SW_CONF	0x1082102c
++#define USI_V1_SW_CONF_MASK		0xf
++#define USI_V1_SW_CONF_I2C1		0x2
++
++static void usi13_i2c_init(void)
++{
++	cmu_gate_enable(CMU_GATE_CMU_PERIC1_USI13);
++	cmu_gate_enable(CMU_GATE_SYSREG_PERIC1_PCLK);
++	cmu_gate_enable(CMU_GATE_USI13_PCLK);
++	cmu_gate_enable(CMU_GATE_USI13_SCLK);
++	clrsetbits_le32(SYSREG_PERIC1_USI13_SW_CONF, USI_V1_SW_CONF_MASK,
++			USI_V1_SW_CONF_I2C1);
++}
++
++static int do_muic(struct cmd_tbl *cmdtp, int flag, int argc,
++		   char *const argv[])
++{
++	struct udevice *bus, *chip;
++	int ret, val;
++
++	/* before the controller is probed: it is set up there */
++	usi13_i2c_init();
++
++	ret = uclass_first_device_err(UCLASS_I2C, &bus);
++	if (!ret)
++		ret = dm_i2c_probe(bus, MAX77865_MUIC_ADDR, 0, &chip);
++	if (ret) {
++		printf("MUIC not found: %d\n", ret);
++		return CMD_RET_FAILURE;
++	}
++
++	val = dm_i2c_reg_read(chip, MAX77865_MUIC_REG_CONTROL1);
++	if (argc < 2 || strcmp(argv[1], "usb")) {
++		printf("MUIC CONTROL1: %#x\n", val);
++		return CMD_RET_SUCCESS;
++	}
++
++	ret = dm_i2c_reg_write(chip, MAX77865_MUIC_REG_CONTROL1,
++			       MAX77865_MUIC_COM_USB_AP);
++	if (ret) {
++		printf("MUIC write failed: %d\n", ret);
++		return CMD_RET_FAILURE;
++	}
++	debug("MUIC CONTROL1: %#x -> %#x\n", val, MAX77865_MUIC_COM_USB_AP);
++
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(muic, 2, 0, do_muic,
++	   "MAX77865 MUIC switch",
++	   "     - show the switch setting\n"
++	   "muic usb - connect D+/D- to the SoC's USB");
+diff --git a/board/samsung/dream2lte/dream2lte.env b/board/samsung/dream2lte/dream2lte.env
+new file mode 100644
+index 000000000..631094d80
+--- /dev/null
++++ b/board/samsung/dream2lte/dream2lte.env
+@@ -0,0 +1,51 @@
++/* the keys work as a keyboard: Volume Up/Down move, Power selects */
++stdin=serial,button-kbd
++stdout=serial,vidconsole
++stderr=serial,vidconsole
++
++/*
++ * First DRAM bank: the kernel at 2 MiB, below the ramoops zone at
++ * 0x92000000; the rest above it and below the TIMA carve-out at
++ * 0xb1000000. U-Boot itself relocates to the top of the bank.
++ */
++kernel_addr_r=0x80200000
++fdt_addr_r=0x93000000
++fdtoverlay_addr_r=0x93100000
++scriptaddr=0x93200000
++pxefile_addr_r=0x93300000
++ramdisk_addr_r=0x94000000
++kernel_comp_addr_r=0xa0000000
++kernel_comp_size=0x10000000
++
++/* the root filesystem is the USERDATA partition of the UFS (LUN 0) */
++rootpart=scsi 0#USERDATA
++storage_init=ufs init; scsi scan
++boot_extlinux=run storage_init; sysboot ${rootpart} any ${pxefile_addr_r} /boot/extlinux/extlinux.conf
++
++/*
++ * USB: fastboot (leave with "fastboot reboot", "fastboot continue"...),
++ * mass storage of the whole UFS LUN 0 (all partitions; leave by holding
++ * Power for a forced restart), serial console (CDC ACM)
++ */
++fastboot_partition_alias_boot=BOOT
++fastboot_partition_alias_recovery=RECOVERY
++fastboot_partition_alias_userdata=USERDATA
++fastboot_mode=run storage_init; muic usb; echo "Fastboot mode"; fastboot usb 0
++ums_mode=run storage_init; muic usb; echo "USB mass storage (UFS LUN 0)"; ums 0 scsi 0
++usb_console=muic usb; setenv stdin serial,button-kbd,usbacm; setenv stdout serial,vidconsole,usbacm; setenv stderr serial,vidconsole,usbacm; echo "USB serial console"
++
++bootdelay=1
++/*
++ * The default boot: /boot/extlinux on USERDATA, or the original kernel of
++ * a boot image patched with tools/d2l-bootimg.py (d2l_default=chain), each
++ * falling back to the other. The menu is set up by the board code.
++ */
++d2l_default=extlinux
++boot_chain=if test -n "${d2l_chain_size}"; then chainload; fi
++boot_default=if test "${d2l_default}" = chain; then run boot_chain; run boot_extlinux; else run boot_extlinux; run boot_chain; fi
++bootcmd=if test "${d2l_reboot_mode}" = fastboot; then run fastboot_mode; fi; run boot_default; echo "Booting failed"; bootmenu
++
++/* hold Volume Down while U-Boot starts for the menu */
++button_cmd_0_name=Volume Down
++button_cmd_0=bootmenu
++
+diff --git a/board/samsung/dream2lte/entry.S b/board/samsung/dream2lte/entry.S
+new file mode 100644
+index 000000000..7c3ff9657
+--- /dev/null
++++ b/board/samsung/dream2lte/entry.S
+@@ -0,0 +1,42 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * First code after the reset vector, entered from S-Boot with the MMU off
++ * and no stack: save x0 (S-Boot's DTB) and our load address, and, for
++ * development, preset the
++ * reboot reason to recovery before anything can go wrong.
++ */
++#include <linux/linkage.h>
++
++#define PMU_INFORM2		0x16480808
++#define PMU_INFORM3		0x1648080c
++#define SEC_POWER_RESET		0x12345678
++#define SEC_REASON_RECOVERY	0x12345674
++
++ENTRY(save_boot_params)
++	adr	x4, sboot_x0
++	str	x0, [x4]
++	adr	x4, sboot_load_addr
++	adr	x5, _start
++	str	x5, [x4]
++#ifdef CONFIG_DREAM2LTE_DEV_RECOVERY
++	ldr	x4, =PMU_INFORM2
++	ldr	w5, =SEC_POWER_RESET
++	str	w5, [x4]
++	ldr	x4, =PMU_INFORM3
++	ldr	w5, =SEC_REASON_RECOVERY
++	str	w5, [x4]
++#endif
++	b	save_boot_params_ret
++	.ltorg
++ENDPROC(save_boot_params)
++
++	.section .data
++	.balign 8
++	.globl	sboot_x0
++sboot_x0:
++	.quad	0
++
++	/* where S-Boot loaded the kernel section of the boot image */
++	.globl	sboot_load_addr
++sboot_load_addr:
++	.quad	0
+diff --git a/board/samsung/dream2lte/ramoops-console.c b/board/samsung/dream2lte/ramoops-console.c
+new file mode 100644
+index 000000000..e8d20b4a1
+--- /dev/null
++++ b/board/samsung/dream2lte/ramoops-console.c
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Console output into the ramoops console zone (dream2lte)
++ *
++ * The phone's UART is only reachable through the USB connector with a
++ * special cable, so U-Boot writes its console into the persistent RAM
++ * zone the kernels on this phone read back as pstore:
++ *
++ * - TWRP (vendor 4.4 kernel, exynos-snapshot "log_pstore") shows the zone
++ *   as /sys/fs/pstore/pmsg-ramoops-0,
++ * - a mainline kernel with the ramoops node of exynos8895-dream2lte.dts
++ *   (0x92000000, record-size and console-size 0x4000) shows it as
++ *   /sys/fs/pstore/console-ramoops-0 on the next boot.
++ *
++ * The layout is struct persistent_ram_buffer of the Linux kernel: a
++ * signature, the write position and the fill level, then the ring buffer.
++ * The board maps the zone non-cacheable, so the log survives a reset that
++ * doesn't write the caches back.
++ */
++
++#include <dm.h>
++#include <serial.h>
++#include <asm/global_data.h>
++#include <asm/io.h>
++#include <linux/compiler.h>
++
++DECLARE_GLOBAL_DATA_PTR;
++
++#define RAMOOPS_CONSOLE_BASE	0x92004000UL
++#define RAMOOPS_CONSOLE_SIZE	0x4000UL
++#define PERSISTENT_RAM_SIG	0x43474244	/* "DBGC" */
++
++struct persistent_ram_buffer {
++	u32 sig;
++	u32 start;
++	u32 size;
++	u8 data[];
++};
++
++#define RAMOOPS_DATA_SIZE \
++	(RAMOOPS_CONSOLE_SIZE - sizeof(struct persistent_ram_buffer))
++
++static struct persistent_ram_buffer *ramoops_buf(void)
++{
++	return (struct persistent_ram_buffer *)RAMOOPS_CONSOLE_BASE;
++}
++
++static void ramoops_putc_raw(char ch)
++{
++	struct persistent_ram_buffer *buf = ramoops_buf();
++	u32 start = readl(&buf->start);
++	u32 size = readl(&buf->size);
++
++	if (start >= RAMOOPS_DATA_SIZE)
++		start = 0;
++	writeb(ch, &buf->data[start]);
++	writel((start + 1) % RAMOOPS_DATA_SIZE, &buf->start);
++	if (size < RAMOOPS_DATA_SIZE)
++		writel(size + 1, &buf->size);
++}
++
++static int ramoops_console_putc(struct udevice *dev, const char ch)
++{
++	/* pstore readers expect Unix line endings */
++	if (ch != '\r')
++		ramoops_putc_raw(ch);
++
++	return 0;
++}
++
++static int ramoops_console_getc(struct udevice *dev)
++{
++	return -EAGAIN;
++}
++
++static int ramoops_console_pending(struct udevice *dev, bool input)
++{
++	return 0;
++}
++
++static int ramoops_console_setbrg(struct udevice *dev, int baudrate)
++{
++	return 0;
++}
++
++static int ramoops_console_probe(struct udevice *dev)
++{
++	struct persistent_ram_buffer *buf = ramoops_buf();
++
++	/*
++	 * Start a new log once per boot, in the pre-relocation probe. The
++	 * probe after relocation keeps writing to it.
++	 */
++	if (!(gd->flags & GD_FLG_RELOC) || readl(&buf->sig) != PERSISTENT_RAM_SIG) {
++		writel(0, &buf->start);
++		writel(0, &buf->size);
++		writel(PERSISTENT_RAM_SIG, &buf->sig);
++	}
++
++	return 0;
++}
++
++static const struct dm_serial_ops ramoops_console_ops = {
++	.putc = ramoops_console_putc,
++	.getc = ramoops_console_getc,
++	.pending = ramoops_console_pending,
++	.setbrg = ramoops_console_setbrg,
++};
++
++U_BOOT_DRIVER(ramoops_console) = {
++	.name	= "ramoops_console",
++	.id	= UCLASS_SERIAL,
++	.probe	= ramoops_console_probe,
++	.ops	= &ramoops_console_ops,
++	.flags	= DM_FLAG_PRE_RELOC,
++};
++
++U_BOOT_DRVINFO(ramoops_console) = {
++	.name = "ramoops_console",
++};
+diff --git a/configs/dream2lte_defconfig b/configs/dream2lte_defconfig
+new file mode 100644
+index 000000000..8fe6ec0e2
+--- /dev/null
++++ b/configs/dream2lte_defconfig
+@@ -0,0 +1,92 @@
++CONFIG_ARM=y
++CONFIG_SKIP_LOWLEVEL_INIT=y
++CONFIG_COUNTER_FREQUENCY=26000000
++CONFIG_ARCH_EXYNOS=y
++CONFIG_TEXT_BASE=0x80080000
++CONFIG_INIT_SP_RELATIVE=y
++CONFIG_SYS_MALLOC_LEN=0x2000000
++CONFIG_SYS_MALLOC_F_LEN=0x16000
++CONFIG_TARGET_DREAM2LTE=y
++CONFIG_NR_DRAM_BANKS=1
++CONFIG_DEFAULT_DEVICE_TREE="exynos8895-dream2lte"
++CONFIG_SYS_BOOTM_LEN=0x8000000
++CONFIG_SYS_LOAD_ADDR=0x80200000
++CONFIG_ARMV8_CNTFRQ_BROKEN=y
++# CONFIG_PSCI_RESET is not set
++# CONFIG_ARCH_FIXUP_FDT_MEMORY is not set
++CONFIG_POSITION_INDEPENDENT=y
++CONFIG_OF_BOARD_SETUP=y
++CONFIG_BOOTSTD_DEFAULTS=y
++CONFIG_USE_PREBOOT=y
++CONFIG_SYS_PBSIZE=1024
++# CONFIG_DISPLAY_CPUINFO is not set
++CONFIG_MISC_INIT_R=y
++CONFIG_HUSH_PARSER=y
++CONFIG_CMD_BOOTMENU=y
++CONFIG_CMD_POWEROFF=y
++CONFIG_CMD_CLK=y
++CONFIG_CMD_MEMINFO=y
++CONFIG_CMD_FS_GENERIC=y
++CONFIG_EFI_PARTITION=y
++CONFIG_ENV_IS_NOWHERE=y
++CONFIG_CLK=y
++CONFIG_DM_SERIAL=y
++CONFIG_REGMAP=y
++CONFIG_SYSCON=y
++CONFIG_SYSRESET=y
++CONFIG_SYSRESET_CMD_POWEROFF=y
++CONFIG_VIDEO=y
++CONFIG_VIDEO_SIMPLE=y
++# CONFIG_VIDEO_FONT_8X16 is not set
++CONFIG_VIDEO_FONT_16X32=y
++CONFIG_FS_EXT4=y
++# CONFIG_S5P_SERIAL is not set
++# CONFIG_PWM_S5P is not set
++CONFIG_CMD_SCSI=y
++CONFIG_CMD_UFS=y
++CONFIG_CMD_EXT4=y
++CONFIG_CMD_PART=y
++CONFIG_SCSI=y
++CONFIG_UFS=y
++CONFIG_UFS_EXYNOS=y
++CONFIG_BOUNCE_BUFFER=y
++CONFIG_CMD_MD5SUM=y
++CONFIG_CMD_TIMER=y
++CONFIG_BOOTSTD_FULL=y
++CONFIG_CMD_SYSBOOT=y
++# CONFIG_EFI_LOADER is not set
++CONFIG_PINCTRL=y
++CONFIG_PINCTRL_EXYNOS8895=y
++CONFIG_DM_GPIO=y
++CONFIG_CMD_GPIO=y
++CONFIG_BUTTON=y
++CONFIG_BUTTON_GPIO=y
++CONFIG_BUTTON_KEYBOARD=y
++CONFIG_BUTTON_REMAP_PHONE_KEYS=y
++CONFIG_BUTTON_CMD=y
++CONFIG_CMD_BUTTON=y
++CONFIG_VIDEO_ANSI=y
++CONFIG_PHY=y
++CONFIG_PHY_EXYNOS_USBDRD=y
++CONFIG_USB=y
++CONFIG_DM_USB_GADGET=y
++CONFIG_USB_DWC3=y
++CONFIG_USB_DWC3_GENERIC=y
++CONFIG_USB_GADGET=y
++CONFIG_USB_GADGET_MANUFACTURER="Samsung"
++CONFIG_USB_GADGET_VENDOR_NUM=0x04e8
++CONFIG_USB_GADGET_PRODUCT_NUM=0x6602
++CONFIG_USB_FUNCTION_FASTBOOT=y
++CONFIG_FASTBOOT_BUF_ADDR=0x94000000
++CONFIG_FASTBOOT_BUF_SIZE=0x1c000000
++CONFIG_FASTBOOT_FLASH=y
++CONFIG_FASTBOOT_FLASH_BLOCK=y
++CONFIG_FASTBOOT_FLASH_BLOCK_INTERFACE_NAME="scsi"
++CONFIG_FASTBOOT_FLASH_BLOCK_DEVICE_ID=0
++CONFIG_CMD_USB_MASS_STORAGE=y
++CONFIG_USB_FUNCTION_ACM=y
++CONFIG_MISC=y
++CONFIG_DM_I2C=y
++CONFIG_SYS_I2C_S3C24X0=y
++CONFIG_CMD_I2C=y
++CONFIG_SIMPLE_BUS=y
+diff --git a/include/configs/dream2lte.h b/include/configs/dream2lte.h
+new file mode 100644
+index 000000000..dc04beab0
+--- /dev/null
++++ b/include/configs/dream2lte.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Samsung Galaxy S8/S8+ (Exynos 8895) board configuration
++ */
++
++#ifndef __CONFIG_DREAM2LTE_H
++#define __CONFIG_DREAM2LTE_H
++
++#define CFG_SYS_BAUDRATE_TABLE	{ 115200 }
++
++#endif /* __CONFIG_DREAM2LTE_H */
+-- 
+2.56.0
+

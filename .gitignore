@@ -1,0 +1,7 @@
+/u-boot/
+/build/
+/build-*/
+/out/
+/backup/
+# Samsung's DTB image, extract it from your own boot image
+/tools/sboot-dtbh.img

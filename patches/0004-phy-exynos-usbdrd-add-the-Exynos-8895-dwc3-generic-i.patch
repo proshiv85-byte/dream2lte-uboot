@@ -1,0 +1,339 @@
+From ccc4918c9a7bb6199c328935e08aa2e5a63ac256 Mon Sep 17 00:00:00 2001
+From: proshiv85-byte <proshiv85@gmail.com>
+Date: Tue, 17 Nov 2026 20:13:16 +0200
+Subject: [PATCH 4/6] phy: exynos-usbdrd: add the Exynos 8895, dwc3-generic:
+ its glue
+
+High-speed part of the Exynos 8895 USB 3.0 DRD PHY ("USBCON" with two
+ports, one per Type-C orientation), the sequence of the vendor kernel's
+USB PHY CAL as in Linux. The clocks may be left out of the device tree
+on boards without a clock driver.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/phy/phy-exynos-usbdrd.c | 221 +++++++++++++++++++++++++++++++-
+ drivers/usb/dwc3/dwc3-generic.c |   1 +
+ 2 files changed, 220 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/phy/phy-exynos-usbdrd.c b/drivers/phy/phy-exynos-usbdrd.c
+index c5eed29a2..06735b60c 100644
+--- a/drivers/phy/phy-exynos-usbdrd.c
++++ b/drivers/phy/phy-exynos-usbdrd.c
+@@ -96,6 +96,12 @@
+ #define PHYPARAM0_OTGTUNE			GENMASK(5, 3)
+ #define PHYPARAM0_COMPDISTUNE			GENMASK(2, 0)
+ 
++#define EXYNOS5_DRD_PHYPIPE			0x0c
++#define EXYNOS5_DRD_PHYTEST			0x28
++#define PHYTEST_POWERDOWN_SSP			BIT(3)
++#define PHYTEST_POWERDOWN_HSP			BIT(2)
++#define EXYNOS5_DRD_PHYRESUME			0x34
++
+ #define EXYNOS5_DRD_LINKPORT			0x44
+ #define LINKPORT_HOST_U3_PORT_DISABLE		BIT(8)
+ #define LINKPORT_HOST_U2_PORT_DISABLE		BIT(7)
+@@ -146,17 +152,55 @@
+ #define EXYNOS850_DRD_HSP_TEST			0x5c
+ #define HSP_TEST_SIDDQ				BIT(24)
+ 
++/*
++ * Exynos8895 "USBCON" v1.1.1: USB 3.0 DRD PHY with two ports, one for each
++ * Type-C orientation. Only the high-speed part of port 0 is used here.
++ * Sequence of the vendor kernel's USB PHY CAL, as in Linux.
++ */
++#define EXYNOS8895_DRD_PHYPIPE_CLOCK_SEL	BIT(4)
++#define EXYNOS8895_DRD_PHYPARAM0_TXVREFTUNE	GENMASK(25, 22)
++#define EXYNOS8895_DRD_PHYPARAM0_TXRISETUNE	GENMASK(21, 20)
++#define EXYNOS8895_DRD_PHYPARAM0_TXRESTUNE	GENMASK(19, 18)
++#define EXYNOS8895_DRD_PHYPARAM0_TXPREEMPPULSE	BIT(17)
++#define EXYNOS8895_DRD_PHYPARAM0_TXPREEMPAMP	GENMASK(16, 15)
++#define EXYNOS8895_DRD_PHYPARAM0_TXHSXVTUNE	GENMASK(14, 13)
++#define EXYNOS8895_DRD_PHYPARAM0_TXFSLSTUNE	GENMASK(12, 9)
++#define EXYNOS8895_DRD_PHYPARAM0_SQRXTUNE	GENMASK(8, 6)
++#define EXYNOS8895_DRD_PHYPARAM0_OTGTUNE	GENMASK(5, 3)
++#define EXYNOS8895_DRD_PHYPARAM0_COMPDISTUNE	GENMASK(2, 0)
++#define EXYNOS8895_DRD_PHYRESUME_DIS_LINKGATE	BIT(13)
++#define EXYNOS8895_DRD_PHYRESUME_DIS_ID0	BIT(12)
++#define EXYNOS8895_DRD_PHYRESUME_DIS_VBUSVALID	BIT(11)
++#define EXYNOS8895_DRD_PHYRESUME_DIS_BVALID	BIT(10)
++#define EXYNOS8895_DRD_PHYRESUME_FORCE_QACT	BIT(9)
++#define EXYNOS8895_DRD_LINKSYSTEM_LINK_SW_RST	BIT(28)
++#define EXYNOS8895_DRD_LINKPORT_U3_DISABLE	BIT(8)
++#define EXYNOS8895_DRD_LINKPORT_OVCR_U3_SEL	BIT(3)
++#define EXYNOS8895_DRD_LINKPORT_OVCR_U2_SEL	BIT(2)
++#define EXYNOS8895_DRD_PHYSELECTION		0x6c
++#define EXYNOS8895_DRD_PHYSEL_PIPE_CLK		BIT(3)
++#define EXYNOS8895_DRD_PHYSEL_PIPE		BIT(1)
++
++/* reference clock: 26 MHz from the clock core */
++#define EXYNOS8895_REFCLKSEL_CLKCORE		0x2
++#define EXYNOS8895_FSEL_26MHZ			0x2
++#define EXYNOS8895_MPLL_MULTIPLIER_26MHZ	0x60
++#define EXYNOS8895_SSC_REFCLKSEL_26MHZ		0x108U
++
+ #define KHZ					1000
+ #define MHZ					(KHZ * KHZ)
+ 
+ enum exynos_usbdrd_phy_variant {
+ 	EXYNOS7870_USBDRD_PHY,
+ 	EXYNOS850_USBDRD_PHY,
++	EXYNOS8895_USBDRD_PHY,
+ };
+ 
+ /**
+  * struct exynos_usbdrd_phy - driver data for Exynos USB PHY
+  * @reg_phy: USB PHY controller register memory base
++ * @reg_phy2: registers of the second port (Exynos8895)
++ * @reg_refclk: reference clock control (Exynos8895)
+  * @clk: clock for register access
+  * @core_clk: core clock for phy (ref clock)
+  * @reg_pmu: regmap for PMU block
+@@ -165,6 +209,8 @@ enum exynos_usbdrd_phy_variant {
+  */
+ struct exynos_usbdrd_phy {
+ 	void __iomem *reg_phy;
++	void __iomem *reg_phy2;
++	void __iomem *reg_refclk;
+ 	struct clk *clk;
+ 	struct clk *core_clk;
+ 	struct regmap *reg_pmu;
+@@ -471,6 +517,148 @@ static void exynos850_usbdrd_utmi_exit(struct phy *phy)
+ 	writel(reg, regs_base + EXYNOS850_DRD_CLKRST);
+ }
+ 
++static void exynos8895_usbdrd_utmi_init(struct phy *phy)
++{
++	struct exynos_usbdrd_phy *phy_drd = dev_get_priv(phy->dev);
++	void __iomem *base = phy_drd->reg_phy;
++	void __iomem *base2 = phy_drd->reg_phy2;
++	u32 reg, clkrst;
++
++	/* reference clock path of the PHY */
++	setbits_le32(phy_drd->reg_refclk + 0xc, BIT(24));
++
++	/* Q-channel workaround: ignore the q-active requests from the PHY */
++	reg = readl(base + EXYNOS5_DRD_PHYRESUME);
++	reg |= EXYNOS8895_DRD_PHYRESUME_DIS_ID0 |
++	       EXYNOS8895_DRD_PHYRESUME_DIS_VBUSVALID |
++	       EXYNOS8895_DRD_PHYRESUME_DIS_BVALID |
++	       EXYNOS8895_DRD_PHYRESUME_DIS_LINKGATE;
++	reg &= ~EXYNOS8895_DRD_PHYRESUME_FORCE_QACT;
++	udelay(500);
++	writel(reg, base + EXYNOS5_DRD_PHYRESUME);
++	udelay(500);
++	reg |= EXYNOS8895_DRD_PHYRESUME_FORCE_QACT;
++	udelay(500);
++	writel(reg, base + EXYNOS5_DRD_PHYRESUME);
++
++	reg = readl(base + EXYNOS5_DRD_LINKSYSTEM);
++	writel(reg | EXYNOS8895_DRD_LINKSYSTEM_LINK_SW_RST,
++	       base + EXYNOS5_DRD_LINKSYSTEM);
++	udelay(10);
++	writel(reg & ~EXYNOS8895_DRD_LINKSYSTEM_LINK_SW_RST,
++	       base + EXYNOS5_DRD_LINKSYSTEM);
++
++	/* PIPE3 from port 0 */
++	clrbits_le32(base + EXYNOS8895_DRD_PHYSELECTION,
++		     EXYNOS8895_DRD_PHYSEL_PIPE | EXYNOS8895_DRD_PHYSEL_PIPE_CLK);
++
++	clkrst = readl(base + EXYNOS5_DRD_PHYCLKRST);
++	clkrst |= PHYCLKRST_PORTRESET;
++	clkrst &= ~PHYCLKRST_REFCLKSEL;
++	clkrst |= FIELD_PREP(PHYCLKRST_REFCLKSEL, EXYNOS8895_REFCLKSEL_CLKCORE);
++	clkrst &= ~(PHYCLKRST_FSEL_PIPE | PHYCLKRST_FSEL_UTMI);
++	clkrst |= FIELD_PREP(PHYCLKRST_FSEL_UTMI, EXYNOS8895_FSEL_26MHZ);
++
++	/* common block on in suspend, not controlled by the link */
++	clkrst &= ~(PHYCLKRST_COMMONONN | PHYCLKRST_EN_UTMISUSPEND);
++	clkrst |= PHYCLKRST_RETENABLEN | PHYCLKRST_REF_SSP_EN;
++
++	clrbits_le32(base + EXYNOS5_DRD_PHYPARAM0, PHYPARAM0_REF_USE_PAD);
++
++	clkrst &= ~(PHYCLKRST_MPLL_MULTIPLIER | PHYCLKRST_REF_CLKDIV2);
++	clkrst |= FIELD_PREP(PHYCLKRST_MPLL_MULTIPLIER,
++			     EXYNOS8895_MPLL_MULTIPLIER_26MHZ);
++	/* the vendor code shifts the 9-bit value into the 8-bit field */
++	clkrst &= ~PHYCLKRST_SSC_REFCLKSEL;
++	clkrst |= EXYNOS8895_SSC_REFCLKSEL_26MHZ << 23;
++	clkrst |= PHYCLKRST_SSC_EN;
++	clkrst &= ~PHYCLKRST_SSC_RANGE;
++
++	/* UTMI clock from the PHY */
++	setbits_le32(base + EXYNOS5_DRD_PHYPIPE, EXYNOS8895_DRD_PHYPIPE_CLOCK_SEL);
++
++	writel(clkrst, base + EXYNOS5_DRD_PHYCLKRST);
++	udelay(10);
++	clkrst &= ~PHYCLKRST_PORTRESET;
++	writel(clkrst, base + EXYNOS5_DRD_PHYCLKRST);
++
++	/* power up port 0, power down the second port */
++	clrbits_le32(base + EXYNOS5_DRD_PHYTEST,
++		     PHYTEST_POWERDOWN_HSP | PHYTEST_POWERDOWN_SSP);
++	clrbits_le32(base2 + EXYNOS5_DRD_PHYTEST,
++		     PHYTEST_POWERDOWN_HSP | PHYTEST_POWERDOWN_SSP);
++	udelay(1000);
++	setbits_le32(base2 + EXYNOS5_DRD_PHYTEST,
++		     PHYTEST_POWERDOWN_HSP | PHYTEST_POWERDOWN_SSP);
++	setbits_le32(base2 + EXYNOS5_DRD_PHYUTMI,
++		     PHYUTMI_FORCESLEEP | PHYUTMI_FORCESUSPEND);
++	udelay(500);
++
++	/* VBUS is not routed to the PHY: force VBUS valid */
++	setbits_le32(base + EXYNOS5_DRD_LINKSYSTEM,
++		     LINKSYSTEM_FORCE_BVALID | LINKSYSTEM_FORCE_VBUSVALID);
++
++	reg = readl(base + EXYNOS5_DRD_PHYUTMI);
++	reg &= ~(PHYUTMI_FORCESLEEP | PHYUTMI_FORCESUSPEND |
++		 PHYUTMI_DMPULLDOWN | PHYUTMI_DPPULLDOWN | PHYUTMI_DRVVBUS);
++	reg |= PHYUTMI_VBUSVLDEXTSEL | PHYUTMI_VBUSVLDEXT | PHYUTMI_OTGDISABLE;
++	writel(reg, base + EXYNOS5_DRD_PHYUTMI);
++
++	reg = readl(base + EXYNOS5_DRD_LINKPORT);
++	reg |= EXYNOS8895_DRD_LINKPORT_OVCR_U3_SEL |
++	       EXYNOS8895_DRD_LINKPORT_OVCR_U2_SEL;
++	reg &= ~EXYNOS8895_DRD_LINKPORT_U3_DISABLE;
++	writel(reg, base + EXYNOS5_DRD_LINKPORT);
++
++	/* device mode tuning */
++	reg = readl(base + EXYNOS5_DRD_LINKSYSTEM);
++	reg &= ~LINKSYSTEM_FLADJ;
++	reg |= FIELD_PREP(LINKSYSTEM_FLADJ, 0x20) |
++	       LINKSYSTEM_XHCI_VERSION_CONTROL;
++	writel(reg, base + EXYNOS5_DRD_LINKSYSTEM);
++
++	reg = readl(base + EXYNOS5_DRD_PHYPARAM0);
++	reg &= ~(EXYNOS8895_DRD_PHYPARAM0_TXVREFTUNE |
++		 EXYNOS8895_DRD_PHYPARAM0_TXRISETUNE |
++		 EXYNOS8895_DRD_PHYPARAM0_TXRESTUNE |
++		 EXYNOS8895_DRD_PHYPARAM0_TXPREEMPPULSE |
++		 EXYNOS8895_DRD_PHYPARAM0_TXPREEMPAMP |
++		 EXYNOS8895_DRD_PHYPARAM0_TXHSXVTUNE |
++		 EXYNOS8895_DRD_PHYPARAM0_TXFSLSTUNE |
++		 EXYNOS8895_DRD_PHYPARAM0_SQRXTUNE |
++		 EXYNOS8895_DRD_PHYPARAM0_OTGTUNE |
++		 EXYNOS8895_DRD_PHYPARAM0_COMPDISTUNE);
++	reg |= FIELD_PREP(EXYNOS8895_DRD_PHYPARAM0_TXVREFTUNE, 0xc) |
++	       FIELD_PREP(EXYNOS8895_DRD_PHYPARAM0_TXRISETUNE, 0x1) |
++	       FIELD_PREP(EXYNOS8895_DRD_PHYPARAM0_TXRESTUNE, 0x3) |
++	       FIELD_PREP(EXYNOS8895_DRD_PHYPARAM0_TXPREEMPAMP, 0x3) |
++	       FIELD_PREP(EXYNOS8895_DRD_PHYPARAM0_TXHSXVTUNE, 0x3) |
++	       FIELD_PREP(EXYNOS8895_DRD_PHYPARAM0_TXFSLSTUNE, 0x3) |
++	       FIELD_PREP(EXYNOS8895_DRD_PHYPARAM0_SQRXTUNE, 0x4) |
++	       FIELD_PREP(EXYNOS8895_DRD_PHYPARAM0_OTGTUNE, 0x3) |
++	       FIELD_PREP(EXYNOS8895_DRD_PHYPARAM0_COMPDISTUNE, 0x2);
++	writel(reg, base + EXYNOS5_DRD_PHYPARAM0);
++}
++
++static void exynos8895_usbdrd_utmi_exit(struct phy *phy)
++{
++	struct exynos_usbdrd_phy *phy_drd = dev_get_priv(phy->dev);
++	void __iomem *base = phy_drd->reg_phy;
++	u32 reg;
++
++	reg = readl(base + EXYNOS5_DRD_PHYUTMI);
++	reg &= ~(PHYUTMI_IDPULLUP | PHYUTMI_DRVVBUS |
++		 PHYUTMI_VBUSVLDEXTSEL | PHYUTMI_VBUSVLDEXT);
++	reg |= PHYUTMI_FORCESUSPEND | PHYUTMI_FORCESLEEP;
++	writel(reg, base + EXYNOS5_DRD_PHYUTMI);
++
++	setbits_le32(base + EXYNOS5_DRD_PHYTEST,
++		     PHYTEST_POWERDOWN_HSP | PHYTEST_POWERDOWN_SSP);
++
++	clrbits_le32(base + EXYNOS5_DRD_LINKSYSTEM,
++		     LINKSYSTEM_FORCE_BVALID | LINKSYSTEM_FORCE_VBUSVALID);
++}
++
+ static int exynos_usbdrd_phy_init(struct phy *phy)
+ {
+ 	struct exynos_usbdrd_phy *phy_drd = dev_get_priv(phy->dev);
+@@ -487,6 +675,9 @@ static int exynos_usbdrd_phy_init(struct phy *phy)
+ 	case EXYNOS850_USBDRD_PHY:
+ 		exynos850_usbdrd_utmi_init(phy);
+ 		break;
++	case EXYNOS8895_USBDRD_PHY:
++		exynos8895_usbdrd_utmi_init(phy);
++		break;
+ 	default:
+ 		dev_err(phy->dev, "Failed to recognize phy variant\n");
+ 	}
+@@ -512,6 +703,9 @@ static int exynos_usbdrd_phy_exit(struct phy *phy)
+ 	case EXYNOS850_USBDRD_PHY:
+ 		exynos850_usbdrd_utmi_exit(phy);
+ 		break;
++	case EXYNOS8895_USBDRD_PHY:
++		exynos8895_usbdrd_utmi_exit(phy);
++		break;
+ 	default:
+ 		dev_err(phy->dev, "Failed to recognize phy variant\n");
+ 	}
+@@ -587,14 +781,35 @@ static int exynos_usbdrd_phy_probe(struct udevice *dev)
+ 	struct exynos_usbdrd_phy *phy_drd = dev_get_priv(dev);
+ 	int err;
+ 
++	phy_drd->variant = dev_get_driver_data(dev);
++
+ 	phy_drd->reg_phy = dev_read_addr_ptr(dev);
+ 	if (!phy_drd->reg_phy)
+ 		return -EINVAL;
+ 
++	if (phy_drd->variant == EXYNOS8895_USBDRD_PHY) {
++		phy_drd->reg_phy2 = dev_read_addr_index_ptr(dev, 1);
++		phy_drd->reg_refclk = dev_read_addr_index_ptr(dev, 2);
++		if (!phy_drd->reg_phy2 || !phy_drd->reg_refclk)
++			return -EINVAL;
++
++		/* newer USBCON versions have a version register at 0 */
++		if (readl(phy_drd->reg_phy)) {
++			phy_drd->reg_phy += 4;
++			phy_drd->reg_phy2 += 4;
++		}
++
++		/* the clocks may be left as the previous bootloader set them */
++		if (!dev_read_prop(dev, "clocks", NULL))
++			goto pmu;
++	}
++
+ 	err = exynos_usbdrd_phy_init_clk(dev);
+ 	if (err)
+ 		return err;
+ 
++pmu:
++
+ 	phy_drd->reg_pmu = syscon_regmap_lookup_by_phandle(dev,
+ 							  "samsung,pmu-syscon");
+ 	if (IS_ERR(phy_drd->reg_pmu)) {
+@@ -603,8 +818,6 @@ static int exynos_usbdrd_phy_probe(struct udevice *dev)
+ 		return err;
+ 	}
+ 
+-	phy_drd->variant = dev_get_driver_data(dev);
+-
+ 	return 0;
+ }
+ 
+@@ -624,6 +837,10 @@ static const struct udevice_id exynos_usbdrd_phy_of_match[] = {
+ 		.compatible = "samsung,exynos850-usbdrd-phy",
+ 		.data = EXYNOS850_USBDRD_PHY,
+ 	},
++	{
++		.compatible = "samsung,exynos8895-usbdrd-phy",
++		.data = EXYNOS8895_USBDRD_PHY,
++	},
+ 	{ }
+ };
+ 
+diff --git a/drivers/usb/dwc3/dwc3-generic.c b/drivers/usb/dwc3/dwc3-generic.c
+index 2406f8446..2c5afc4c6 100644
+--- a/drivers/usb/dwc3/dwc3-generic.c
++++ b/drivers/usb/dwc3/dwc3-generic.c
+@@ -762,6 +762,7 @@ static const struct udevice_id dwc3_glue_ids[] = {
+ 	{ .compatible = "intel,tangier-dwc3" },
+ 	{ .compatible = "samsung,exynos7870-dwusb3" },
+ 	{ .compatible = "samsung,exynos850-dwusb3" },
++	{ .compatible = "samsung,exynos8895-dwusb3" },
+ 	{ }
+ };
+ 
+-- 
+2.56.0
+
